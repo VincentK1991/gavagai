@@ -213,13 +213,25 @@ PlanNode (interface)
 
 ### Fan-out detection rule (v1)
 
-A fan-out condition exists when an additive metric's source dataset is on the **many** side of a one-to-many join and the query does not aggregate over the join key. The compiler must return an error of the form:
+> **Correction (implemented semantics):** an earlier draft of this rule said the
+> *many* side fans out. That is backwards — joining many `orders` to one
+> `customer` does **not** duplicate `orders` rows. The implemented (and correct)
+> rule is below.
 
-```
-fan-out detected: metric "orders.revenue" (source: orders) is on the many-side of
-join orders→customers (orders.customer_id → customers.id); this query would
-double-count. Add "orders.customer_id" to dimensions, or remove the join.
-```
+A metric sourced at dataset **D** fans out when **D is on the *one* side** of a
+join edge in use (its rows are multiplied by the *many* side) **and** the
+metric's aggregate is not robust to row duplication. OSI relationships are
+`from` (many, foreign key) → `to` (one, primary key), so D fans out when some
+join edge has `to == D`.
+
+Aggregate safety:
+
+- **Unsafe** (double-count under duplication): `SUM`, `AVG`, plain `COUNT(...)`.
+- **Safe** (idempotent under duplication): `COUNT(DISTINCT ...)`, `MIN`, `MAX`.
+
+The compiler returns a `*planner.FanOutError` whose message contains the string
+`fan-out detected`, names the offending metric and the relationship causing the
+duplication, and suggests using a fan-out-safe metric or removing the reference.
 
 No implicit pre-aggregation is performed.
 
