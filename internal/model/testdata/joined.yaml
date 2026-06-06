@@ -1,0 +1,37 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - name: joined_sales
+    description: Two datasets connected by a relationship.
+    datasets:
+      - name: orders
+        source: analytics.public.orders
+        primary_key: [order_id]
+        fields:
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+      - name: customers
+        source: analytics.public.customers
+        primary_key: [id]
+        fields:
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
+            dimension:
+              is_time: false
+    relationships:
+      - name: orders_to_customers
+        from: orders
+        to: customers
+        from_columns: [customer_id]
+        to_columns: [id]
+    metrics:
+      - name: revenue
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(orders.amount)

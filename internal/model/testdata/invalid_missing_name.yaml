@@ -1,0 +1,12 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - description: This model is missing the required name field.
+    datasets:
+      - name: orders
+        source: analytics.public.orders
+        fields:
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
