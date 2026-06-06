@@ -1,8 +1,11 @@
 .PHONY: build test lint clean
 
-# build compiles the gavagai binary.
+# build compiles every package (verification) and writes the gavagai binary.
+# `go build -o <file>` rejects multiple matched packages, so the binary is
+# built from the root main package only.
 build:
-	go build -o bin/gavagai ./...
+	go build ./...
+	go build -o bin/gavagai .
 
 # test runs the full unit test suite.
 test:

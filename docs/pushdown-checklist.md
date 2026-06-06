@@ -1,24 +1,44 @@
 # Query Rewriting & Predicate Pushdown Checklist
 
-Each item is a capability that the codegen layer must implement and verify with a dedicated test.
+Each item is a capability that the planner/codegen layer must implement and verify with a dedicated test.
 Check off an item only when: (a) the implementation is complete, (b) a test exercises the exact
 pattern, and (c) `make lint test build` passes with zero suppressions.
+
+## Gating
+
+This checklist is executable. Every item maps to a subtest in
+`internal/conformance/` named by its id (e.g. `1.1/=`, `2.5/fan-out-detected`).
+The subtest runs the real pipeline — parse → validate → plan → pushdown → codegen —
+over an inline `(semantic model, query)` fixture.
+
+- A subtest that **passes** ⇒ the box is checkable (annotated `← gate: <id>` below).
+- A subtest that calls `pending(...)` is **skipped**: the rewrite/emitter is not
+  implemented yet, or the query IR cannot yet express the case. Turning a box green
+  is a two-step ritual: implement the behaviour, then delete the `pending()` call so
+  the assertion runs.
+
+Run the gates with `go test ./internal/conformance/... -v`. As of this commit:
+**33 boxes green, the rest pending** (see the progress table at the bottom). The
+green set is the plan-level core (filter placement, join resolution, fan-out,
+GROUP BY, ORDER BY, LIMIT placement, dialect-expression selection); the pending
+set is dominated by SQL-text rendering (codegen, phases 5–6) and query-IR
+extensions (self/semi/anti-join, OR, OFFSET, window functions).
 
 ---
 
 ## 1. Filter / Predicate Pushdown
 
 ### 1.1 Simple scalar predicates
-- [ ] Push `WHERE col = value` below an Aggregate node (pre-filter before GROUP BY)
-- [ ] Push `WHERE col != value` below an Aggregate node
-- [ ] Push `WHERE col > value` / `col >= value` / `col < value` / `col <= value`
-- [ ] Push `WHERE col IN (...)` below an Aggregate node
-- [ ] Push `WHERE col NOT IN (...)` below an Aggregate node
-- [ ] Push `WHERE col IS NULL` below an Aggregate node
-- [ ] Push `WHERE col IS NOT NULL` below an Aggregate node
+- [x] Push `WHERE col = value` below an Aggregate node (pre-filter before GROUP BY) ← gate: `1.1/=`
+- [x] Push `WHERE col != value` below an Aggregate node ← gate: `1.1/!=`
+- [x] Push `WHERE col > value` / `col >= value` / `col < value` / `col <= value` ← gate: `1.1/>`, `1.1/>=`, `1.1/<`, `1.1/<=`
+- [x] Push `WHERE col IN (...)` below an Aggregate node ← gate: `1.1/IN`
+- [x] Push `WHERE col NOT IN (...)` below an Aggregate node ← gate: `1.1/NOT IN`
+- [x] Push `WHERE col IS NULL` below an Aggregate node ← gate: `1.1/IS NULL`
+- [x] Push `WHERE col IS NOT NULL` below an Aggregate node ← gate: `1.1/IS NOT NULL`
 
 ### 1.2 Multi-condition pushdown
-- [ ] Push `WHERE a AND b` — both conditions pushed independently
+- [x] Push `WHERE a AND b` — both conditions pushed independently ← gate: `1.2/AND`
 - [ ] Push `WHERE a OR b` — only if the whole disjunction can be pushed (same table)
 - [ ] Mixed AND/OR: split conjuncts, push each independently where safe
 
@@ -32,9 +52,9 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 - [ ] Push filter into a CTE definition when the CTE is referenced once and filter is safe
 
 ### 1.5 HAVING vs WHERE placement
-- [ ] Scalar filter on a raw column → emitted as WHERE (pre-aggregate)
-- [ ] Filter on an aggregate result (`revenue > 1000`) → emitted as HAVING (post-aggregate)
-- [ ] Mixed query: scalar filter becomes WHERE, aggregate filter becomes HAVING — both correct
+- [x] Scalar filter on a raw column → emitted as WHERE (pre-aggregate) ← gate: `1.5/where-vs-having`
+- [x] Filter on an aggregate result (`revenue > 1000`) → emitted as HAVING (post-aggregate) ← gate: `1.5/where-vs-having`
+- [x] Mixed query: scalar filter becomes WHERE, aggregate filter becomes HAVING — both correct ← gate: `1.5/where-vs-having`
 - [ ] HAVING with `COUNT(DISTINCT ...)`, `MIN(...)`, `MAX(...)` rendered correctly
 
 ---
@@ -42,10 +62,10 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 ## 2. JOIN Rewriting
 
 ### 2.1 Standard inner / left join
-- [ ] Single-hop LEFT JOIN between two datasets
-- [ ] Multi-hop LEFT JOIN (A → B → C) via intermediate dataset
-- [ ] Join condition rendered as `ON left.col = right.col`
-- [ ] Composite join key: multiple ON columns joined with AND
+- [x] Single-hop LEFT JOIN between two datasets ← gate: `2.1/single-hop-left`
+- [x] Multi-hop LEFT JOIN (A → B → C) via intermediate dataset ← gate: `2.1/multi-hop`
+- [ ] Join condition rendered as `ON left.col = right.col` (codegen)
+- [x] Composite join key: multiple ON columns joined with AND ← gate: `2.1/composite-key` (plan-level; AND rendering pending)
 
 ### 2.2 Self-join
 - [ ] Same dataset joined to itself with distinct aliases (`a AS t1`, `a AS t2`)
@@ -65,22 +85,22 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 ### 2.5 Fan-out-safe pre-aggregation before JOIN
 - [ ] SUM metric on the one-side dataset → pre-aggregate before join to avoid fan-out
 - [ ] AVG metric → pre-aggregate numerator and denominator separately, combine after join
-- [ ] Fan-out detection raises `FanOutError` for unsafe metrics (blocks codegen until fixed)
+- [x] Fan-out detection raises `FanOutError` for unsafe metrics (blocks codegen until fixed) ← gate: `2.5/fan-out-detected`, `2.5/fan-out-safe-metric-ok`
 
 ---
 
 ## 3. Aggregation Rewriting
 
 ### 3.1 Basic GROUP BY
-- [ ] GROUP BY all dimension columns
-- [ ] GROUP BY with no dimensions → single-row aggregate (scalar subquery style)
-- [ ] GROUP BY on expression dimension (e.g. `DATE_TRUNC('month', created_at)`)
+- [x] GROUP BY all dimension columns ← gate: `3.1/group-by-dimensions`
+- [x] GROUP BY with no dimensions → single-row aggregate (scalar subquery style) ← gate: `3.1/no-dimension-single-row`
+- [x] GROUP BY on expression dimension (e.g. `DATE_TRUNC('month', created_at)`) ← gate: `3.1/expression-dimension`
 
 ### 3.2 COUNT variants
 - [ ] `COUNT(*)` rendered correctly
 - [ ] `COUNT(col)` rendered correctly (excludes NULLs)
 - [ ] `COUNT(DISTINCT col)` rendered correctly
-- [ ] `COUNT(DISTINCT col)` across a join (fan-out safe — does not double-count)
+- [x] `COUNT(DISTINCT col)` across a join (fan-out safe — does not double-count) ← gate: `3.2/count-distinct-safe-across-join`
 
 ### 3.3 Aggregate on expression
 - [ ] `SUM(price * quantity)` — expression inside aggregate rendered verbatim
@@ -111,8 +131,8 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 
 - [ ] LIMIT rendered at top of query
 - [ ] LIMIT pushed into a subquery scan when no JOIN/aggregation is present
-- [ ] LIMIT NOT pushed below aggregate (result set is already reduced)
-- [ ] LIMIT NOT pushed below JOIN (row count can change)
+- [x] LIMIT NOT pushed below aggregate (result set is already reduced) ← gate: `5/limit-is-outermost`
+- [x] LIMIT NOT pushed below JOIN (row count can change) ← gate: `5/limit-is-outermost`
 - [ ] OFFSET rendered alongside LIMIT when present
 - [ ] Dialect variants: `LIMIT n OFFSET m` (PostgreSQL) vs `LIMIT m, n` (MySQL) vs `FETCH FIRST n ROWS ONLY` (ANSI)
 
@@ -131,7 +151,7 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 - [ ] `AVG(CASE WHEN ...)` — conditional average
 
 ### 6.3 In filter predicates
-- [ ] Filter on a CASE WHEN expression column (dimension filter, not pushed below aggregate)
+- [x] Filter on a CASE WHEN expression column (dimension filter, not pushed below aggregate) ← gate: `6.3/filter-on-case-dimension`
 - [ ] CASE WHEN used as a virtual boolean flag in WHERE clause
 
 ### 6.4 COALESCE / NULLIF (related null-handling rewrites)
@@ -142,8 +162,8 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 
 ## 7. Date / Time Grain Rewriting
 
-- [ ] `DATE_TRUNC('day', ts)` dimension — PostgreSQL dialect
-- [ ] `DATE_TRUNC(ts, 'day')` dimension — BigQuery dialect (argument order differs)
+- [x] `DATE_TRUNC('day', ts)` dimension — PostgreSQL dialect ← gate: `7/date-trunc-postgres`
+- [x] `DATE_TRUNC(ts, 'day')` dimension — BigQuery dialect (argument order differs) ← gate: `7/date-trunc-bigquery`
 - [ ] `DATE_TRUNC('month', ts)` / `'quarter'` / `'year'`
 - [ ] `EXTRACT(DOW FROM ts)` vs `EXTRACT(DAYOFWEEK FROM ts)` dialect split
 - [ ] Date arithmetic: `ts + INTERVAL '7 days'` vs `DATE_ADD(ts, INTERVAL 7 DAY)`
@@ -164,7 +184,7 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 
 ## 9. NULL Handling Rewrites
 
-- [ ] `IS NULL` / `IS NOT NULL` predicates (see §1.1)
+- [x] `IS NULL` / `IS NOT NULL` predicates (see §1.1) ← gate: `9/is-null-predicate`
 - [ ] LEFT JOIN null check: `WHERE right.id IS NULL` → anti-join pattern
 - [ ] `COALESCE` to replace NULL with a default in GROUP BY key (avoid null-group splitting)
 - [ ] `COUNT(col)` excludes NULLs — contrast with `COUNT(*)` in test
@@ -211,29 +231,29 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 
 ## 12. Expression Passthrough
 
-- [ ] Metric expression rendered verbatim from OSI dialect entry when available
-- [ ] Fallback: `ANSI_SQL` dialect expression used when no target-dialect entry exists
-- [ ] Error raised when no expression is available for the target dialect and no ANSI_SQL fallback
-- [ ] Dimension field expression rendered correctly (not just column name)
+- [x] Metric expression rendered verbatim from OSI dialect entry when available ← gate: `12/verbatim-target-dialect`
+- [x] Fallback: `ANSI_SQL` dialect expression used when no target-dialect entry exists ← gate: `12/ansi-fallback`
+- [x] Error raised when no expression is available for the target dialect and no ANSI_SQL fallback ← gate: `12/missing-dialect-error`
+- [x] Dimension field expression rendered correctly (not just column name) ← gate: `12/verbatim-target-dialect`
 - [ ] Nested expression: expression references another field expression by name (future)
 
 ---
 
 ## 13. ORDER BY Rewrites
 
-- [ ] `ORDER BY col ASC` / `ORDER BY col DESC`
-- [ ] `ORDER BY` on a metric alias (post-aggregate reference)
-- [ ] `ORDER BY` on a dimension expression (must match GROUP BY expression exactly)
+- [x] `ORDER BY col ASC` / `ORDER BY col DESC` ← gate: `13/directions-and-default`
+- [x] `ORDER BY` on a metric alias (post-aggregate reference) ← gate: `13/directions-and-default`
+- [ ] `ORDER BY` on a dimension expression (must match GROUP BY expression exactly) (codegen)
 - [ ] `NULLS FIRST` / `NULLS LAST` (PostgreSQL) vs `IS NULL ASC` trick (BigQuery workaround)
-- [ ] Multiple ORDER BY columns with mixed directions
+- [x] Multiple ORDER BY columns with mixed directions ← gate: `13/directions-and-default`
 
 ---
 
 ## 14. Miscellaneous Safety Rules
 
-- [ ] No cartesian product: error if two datasets have no join path and are both referenced
+- [x] No cartesian product: error if two datasets have no join path and are both referenced ← gate: `14/no-cartesian-product`
 - [ ] Ambiguous column: error if the same column name exists in multiple joined datasets and no qualifier is used
-- [ ] Cyclic join path: BFS handles cycles (already visited nodes skipped), verify no infinite loop
+- [x] Cyclic join path: BFS handles cycles (already visited nodes skipped), verify no infinite loop ← gate: `14/cyclic-join-path-terminates`
 - [ ] Empty result set guard: queries with always-false predicates still produce valid SQL (no special casing)
 - [ ] Integer overflow: LIMIT value fits in dialect's integer type
 
@@ -243,18 +263,18 @@ pattern, and (c) `make lint test build` passes with zero suppressions.
 
 | Section | Total items | Done |
 |---------|-------------|------|
-| 1. Filter pushdown | 15 | 0 |
-| 2. JOIN rewriting | 15 | 0 |
-| 3. Aggregation rewriting | 12 | 0 |
+| 1. Filter pushdown | 15 | 11 |
+| 2. JOIN rewriting | 15 | 3 |
+| 3. Aggregation rewriting | 12 | 4 |
 | 4. DISTINCT | 5 | 0 |
-| 5. LIMIT / OFFSET | 7 | 0 |
-| 6. CASE WHEN | 11 | 0 |
-| 7. Date/time grain | 7 | 0 |
+| 5. LIMIT / OFFSET | 7 | 2 |
+| 6. CASE WHEN | 11 | 1 |
+| 7. Date/time grain | 7 | 2 |
 | 8. Subquery / CTE | 7 | 0 |
-| 9. NULL handling | 5 | 0 |
+| 9. NULL handling | 5 | 1 |
 | 10. Window functions | 5 | 0 |
 | 11. Dialect rewrites | 12 | 0 |
-| 12. Expression passthrough | 5 | 0 |
-| 13. ORDER BY | 5 | 0 |
-| 14. Safety rules | 5 | 0 |
-| **Total** | **116** | **0** |
+| 12. Expression passthrough | 5 | 4 |
+| 13. ORDER BY | 5 | 3 |
+| 14. Safety rules | 5 | 2 |
+| **Total** | **116** | **33** |

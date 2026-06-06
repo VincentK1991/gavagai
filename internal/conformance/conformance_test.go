@@ -1,0 +1,562 @@
+package conformance
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/vincentk1991/gavagai/internal/codegen"
+	"github.com/vincentk1991/gavagai/internal/planner"
+	"github.com/vincentk1991/gavagai/internal/query"
+)
+
+// This file is the executable form of docs/pushdown-checklist.md. Subtests are
+// named by their checklist id. A passing subtest means the box can be checked;
+// a pending() skip means the box is still open.
+
+// ---------------------------------------------------------------------------
+// §1 Filter / predicate pushdown
+// ---------------------------------------------------------------------------
+
+func TestFilterPushdown(t *testing.T) {
+	// §1.1 — every scalar operator is carried into a FilterNode that sits
+	// below the AggregateNode (i.e. it becomes a WHERE, pre-aggregation).
+	ops := []struct {
+		id     string
+		field  string
+		op     string
+		value  string // empty => nil value
+		isNull bool
+	}{
+		{"1.1/=", "orders.status", "=", `"complete"`, false},
+		{"1.1/!=", "orders.status", "!=", `"complete"`, false},
+		{"1.1/>", "orders.amount", ">", `100`, false},
+		{"1.1/>=", "orders.amount", ">=", `100`, false},
+		{"1.1/<", "orders.amount", "<", `100`, false},
+		{"1.1/<=", "orders.amount", "<=", `100`, false},
+		{"1.1/IN", "orders.status", "IN", `["a","b"]`, false},
+		{"1.1/NOT IN", "orders.status", "NOT IN", `["a","b"]`, false},
+		{"1.1/IS NULL", "orders.status", "IS NULL", ``, true},
+		{"1.1/IS NOT NULL", "orders.status", "IS NOT NULL", ``, true},
+	}
+	for _, tc := range ops {
+		t.Run(tc.id, func(t *testing.T) {
+			f := query.Filter{Field: tc.field, Op: tc.op}
+			if tc.value != "" {
+				f.Value = raw(tc.value)
+			}
+			q := &query.Query{Metrics: []string{"orders.item_count"}, Filters: []query.Filter{f}}
+			plan := mustPlan(t, q)
+
+			filters := nodesOf[*planner.FilterNode](plan)
+			if len(filters) != 1 {
+				t.Fatalf("want 1 FilterNode, got %d", len(filters))
+			}
+			preds := filters[0].Predicates
+			if len(preds) != 1 || preds[0].Op != tc.op {
+				t.Fatalf("predicate op: want %q, got %+v", tc.op, preds)
+			}
+			if tc.isNull && preds[0].Value != nil {
+				t.Errorf("%s should carry a nil value, got %s", tc.op, preds[0].Value)
+			}
+			if !tc.isNull && preds[0].Value == nil {
+				t.Errorf("%s should carry a value, got nil", tc.op)
+			}
+			// The filter must be below the aggregate (WHERE, not HAVING).
+			aggs := nodesOf[*planner.AggregateNode](plan)
+			if len(aggs) != 1 {
+				t.Fatalf("want 1 AggregateNode, got %d", len(aggs))
+			}
+			if got := nodesOf[*planner.FilterNode](aggs[0].Input); len(got) != 1 {
+				t.Errorf("filter should sit below the aggregate (WHERE), got %d below", len(got))
+			}
+		})
+	}
+
+	// §1.2 — multiple filters AND-combine into one FilterNode.
+	t.Run("1.2/AND", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{
+				{Field: "orders.status", Op: "=", Value: raw(`"complete"`)},
+				{Field: "orders.amount", Op: ">", Value: raw(`100`)},
+			},
+		}
+		plan := mustPlan(t, q)
+		filters := nodesOf[*planner.FilterNode](plan)
+		if len(filters) != 1 || len(filters[0].Predicates) != 2 {
+			t.Fatalf("want 1 FilterNode with 2 predicates, got %+v", filters)
+		}
+	})
+
+	t.Run("1.2/OR", func(t *testing.T) {
+		pending(t, "1.2/OR", "query IR has no OR/disjunction operator yet")
+	})
+
+	// §1.3 — pushdown through join: the real relocation is Phase 4 PushDown.
+	t.Run("1.3/push-into-right-scan", func(t *testing.T) {
+		pending(t, "1.3", "PushDown is an identity stub; filter relocation not implemented")
+	})
+	t.Run("1.3/cross-dataset-stays-above-join", func(t *testing.T) {
+		pending(t, "1.3", "PushDown is an identity stub; scope analysis not implemented")
+	})
+
+	// §1.4 — pushdown into subquery / CTE bodies (codegen).
+	t.Run("1.4/into-subquery", func(t *testing.T) {
+		pending(t, "1.4", "subquery/CTE emission not implemented (codegen)")
+	})
+
+	// §1.5 — scalar filter becomes WHERE; aggregate filter becomes HAVING.
+	t.Run("1.5/where-vs-having", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.revenue"},
+			Dimensions: []string{"orders.status"},
+			Filters:    []query.Filter{{Field: "orders.status", Op: "=", Value: raw(`"complete"`)}},
+			Having:     []query.Having{{Metric: "orders.revenue", Op: ">", Value: 100}},
+		}
+		plan := mustPlan(t, q)
+
+		having, ok := plan.(*planner.HavingNode)
+		if !ok {
+			t.Fatalf("root: want *HavingNode, got %T", plan)
+		}
+		agg, ok := having.Input.(*planner.AggregateNode)
+		if !ok {
+			t.Fatalf("below HAVING: want *AggregateNode, got %T", having.Input)
+		}
+		if _, ok := agg.Input.(*planner.FilterNode); !ok {
+			t.Fatalf("below AGGREGATE: want *FilterNode (WHERE), got %T", agg.Input)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §2 JOIN rewriting
+// ---------------------------------------------------------------------------
+
+func TestJoinRewriting(t *testing.T) {
+	// §2.1 — single-hop LEFT join with the correct ON condition.
+	t.Run("2.1/single-hop-left", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.order_count"}, Dimensions: []string{"customers.region"}}
+		plan := mustPlan(t, q)
+		joins := nodesOf[*planner.JoinNode](plan)
+		if len(joins) != 1 {
+			t.Fatalf("want 1 JoinNode, got %d", len(joins))
+		}
+		jn := joins[0]
+		if jn.Kind != planner.LeftJoin {
+			t.Errorf("join kind: want LEFT, got %q", jn.Kind)
+		}
+		if len(jn.On) != 1 || jn.On[0].Left.Column != "customer_id" || jn.On[0].Right.Column != "customer_id" {
+			t.Errorf("join condition: got %+v", jn.On)
+		}
+	})
+
+	// §2.1 — multi-hop join pulls in the intermediate dataset.
+	t.Run("2.1/multi-hop", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.order_count"}, Dimensions: []string{"products.category"}}
+		plan := mustPlan(t, q)
+		got := scanAliases(plan)
+		for _, want := range []string{"orders", "order_items", "products"} {
+			if !got[want] {
+				t.Errorf("multi-hop plan should scan %q; scans=%v", want, got)
+			}
+		}
+		if n := len(nodesOf[*planner.JoinNode](plan)); n < 2 {
+			t.Errorf("multi-hop should produce >=2 joins, got %d", n)
+		}
+	})
+
+	// §2.1 — composite join key produces one ON condition per key column.
+	t.Run("2.1/composite-key", func(t *testing.T) {
+		m := compositeKeyModel()
+		q := &query.Query{Metrics: []string{"a.cnt"}, Dimensions: []string{"b.k1"}}
+		p, err := planner.Plan(q, m)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		joins := nodesOf[*planner.JoinNode](p)
+		if len(joins) != 1 || len(joins[0].On) != 2 {
+			t.Fatalf("composite key: want 1 join with 2 conditions, got %+v", joins)
+		}
+	})
+
+	// §2.2 self-join, §2.3 semi-join, §2.4 anti-join — not expressible yet.
+	t.Run("2.2/self-join", func(t *testing.T) {
+		pending(t, "2.2", "query IR cannot express a self-join (no per-reference alias)")
+	})
+	t.Run("2.3/semi-join", func(t *testing.T) {
+		pending(t, "2.3", "query IR has no EXISTS/IN-subquery construct")
+	})
+	t.Run("2.4/anti-join", func(t *testing.T) {
+		pending(t, "2.4", "query IR has no NOT EXISTS/NOT IN-subquery construct")
+	})
+
+	// §2.5 — fan-out detection: unsafe aggregate over the "one" side errors.
+	t.Run("2.5/fan-out-detected", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"products.category"}}
+		err := planErr(t, q)
+		var fe *planner.FanOutError
+		if !errors.As(err, &fe) {
+			t.Fatalf("want *FanOutError, got %v", err)
+		}
+	})
+	t.Run("2.5/fan-out-safe-metric-ok", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.order_count"}, Dimensions: []string{"products.category"}}
+		if err := planErr(t, q); err != nil {
+			t.Fatalf("COUNT(DISTINCT) over a fan-out join should be safe, got %v", err)
+		}
+	})
+	t.Run("2.5/pre-aggregation-rewrite", func(t *testing.T) {
+		pending(t, "2.5", "fan-out-safe pre-aggregation rewrite not implemented")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §3 Aggregation rewriting
+// ---------------------------------------------------------------------------
+
+func TestAggregation(t *testing.T) {
+	// §3.1 — GROUP BY carries every dimension.
+	t.Run("3.1/group-by-dimensions", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"orders.status", "orders.order_month"}}
+		plan := mustPlan(t, q)
+		aggs := nodesOf[*planner.AggregateNode](plan)
+		if len(aggs) != 1 || len(aggs[0].GroupBy) != 2 {
+			t.Fatalf("want aggregate grouping by 2 dimensions, got %+v", aggs)
+		}
+	})
+
+	// §3.1 — no-dimension aggregate is a single-row group.
+	t.Run("3.1/no-dimension-single-row", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}}
+		plan := mustPlan(t, q)
+		aggs := nodesOf[*planner.AggregateNode](plan)
+		if len(aggs) != 1 || len(aggs[0].GroupBy) != 0 {
+			t.Fatalf("want aggregate with no GROUP BY, got %+v", aggs)
+		}
+	})
+
+	// §3.1 — an expression dimension (DATE_TRUNC) is groupable.
+	t.Run("3.1/expression-dimension", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"orders.order_month"}}
+		plan := mustPlan(t, q)
+		aggs := nodesOf[*planner.AggregateNode](plan)
+		if len(aggs) != 1 || len(aggs[0].GroupBy) != 1 || aggs[0].GroupBy[0].Field.Name != "order_month" {
+			t.Fatalf("want GROUP BY order_month, got %+v", aggs)
+		}
+	})
+
+	// §3.2 — COUNT(DISTINCT ...) is fan-out safe (covered above); SQL text pending.
+	t.Run("3.2/count-distinct-safe-across-join", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.order_count"}, Dimensions: []string{"products.category"}}
+		if err := planErr(t, q); err != nil {
+			t.Fatalf("COUNT(DISTINCT) across a join should not fan out, got %v", err)
+		}
+	})
+	t.Run("3.2/count-variants-render", func(t *testing.T) {
+		pending(t, "3.2", "COUNT(*) / COUNT(col) SQL rendering not implemented (codegen)")
+	})
+
+	// §3.3 — the conditional-aggregate expression is carried on the metric and
+	// resolves through the shared selector; embedding it in SQL is codegen.
+	t.Run("3.3/conditional-aggregate-expression", func(t *testing.T) {
+		e := ax("SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)")
+		if got, err := codegen.SelectExpression(e, "postgres"); err != nil || got == "" {
+			t.Fatalf("conditional aggregate expression should resolve, got %q err %v", got, err)
+		}
+		pending(t, "3.3", "conditional-aggregate SQL embedding not implemented (codegen)")
+	})
+
+	// §3.4 / §3.5
+	t.Run("3.4/pre-aggregation-pushdown", func(t *testing.T) {
+		pending(t, "3.4", "push-down of partial aggregates not implemented")
+	})
+	t.Run("3.5/rollup-cube-grouping-sets", func(t *testing.T) {
+		pending(t, "3.5", "query IR has no ROLLUP/CUBE/GROUPING SETS construct")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §4 DISTINCT
+// ---------------------------------------------------------------------------
+
+func TestDistinct(t *testing.T) {
+	// §4 — a dimensions-only query is an aggregate with no measures, i.e. the
+	// plan-level signal for SELECT DISTINCT.
+	t.Run("4/select-distinct-no-measures", func(t *testing.T) {
+		q := &query.Query{Dimensions: []string{"orders.status"}}
+		plan := mustPlan(t, q)
+		aggs := nodesOf[*planner.AggregateNode](plan)
+		if len(aggs) != 1 || len(aggs[0].Aggregates) != 0 || len(aggs[0].GroupBy) != 1 {
+			t.Fatalf("dimensions-only query should be a measure-less aggregate, got %+v", aggs)
+		}
+	})
+	t.Run("4/distinct-render", func(t *testing.T) {
+		pending(t, "4", "SELECT DISTINCT / pushed DISTINCT SQL rendering not implemented (codegen)")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §5 LIMIT / OFFSET
+// ---------------------------------------------------------------------------
+
+func TestLimitOffset(t *testing.T) {
+	// §5 — LIMIT becomes the outermost node; it is never pushed below an
+	// aggregate or join.
+	t.Run("5/limit-is-outermost", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Limit: intp(10)}
+		plan := mustPlan(t, q)
+		lim, ok := plan.(*planner.LimitNode)
+		if !ok {
+			t.Fatalf("root: want *LimitNode, got %T", plan)
+		}
+		if lim.Count != 10 {
+			t.Errorf("limit count: want 10, got %d", lim.Count)
+		}
+		if _, isScan := lim.Input.(*planner.ScanNode); isScan {
+			t.Error("LIMIT must not sit directly on a Scan when an aggregate is present")
+		}
+	})
+	t.Run("5/offset", func(t *testing.T) {
+		pending(t, "5", "query IR has no OFFSET field")
+	})
+	t.Run("5/dialect-limit-syntax", func(t *testing.T) {
+		pending(t, "5", "LIMIT/FETCH dialect syntax rendering not implemented (codegen)")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §6 CASE WHEN
+// ---------------------------------------------------------------------------
+
+func TestCaseWhen(t *testing.T) {
+	// §6.3 — a filter over a CASE WHEN dimension is carried as a predicate.
+	t.Run("6.3/filter-on-case-dimension", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{{Field: "orders.status_label", Op: "=", Value: raw(`"done"`)}},
+		}
+		plan := mustPlan(t, q)
+		filters := nodesOf[*planner.FilterNode](plan)
+		if len(filters) != 1 || filters[0].Predicates[0].Field.Name != "status_label" {
+			t.Fatalf("want a filter on status_label, got %+v", filters)
+		}
+	})
+	t.Run("6.1/case-dimension-render", func(t *testing.T) {
+		pending(t, "6.1", "CASE WHEN dimension SQL rendering not implemented (codegen)")
+	})
+	t.Run("6.2/case-metric-render", func(t *testing.T) {
+		pending(t, "6.2", "conditional aggregate SQL rendering not implemented (codegen)")
+	})
+	t.Run("6.4/coalesce-nullif", func(t *testing.T) {
+		pending(t, "6.4", "COALESCE/NULLIF rendering not implemented (codegen)")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §7 Date / time grain  (selection is live via SelectExpression)
+// ---------------------------------------------------------------------------
+
+func TestDateGrain(t *testing.T) {
+	month := dx(
+		[2]string{"ANSI_SQL", "DATE_TRUNC('month', created_at)"},
+		[2]string{"POSTGRES", "DATE_TRUNC('month', created_at)"},
+		[2]string{"BIGQUERY", "DATE_TRUNC(created_at, MONTH)"},
+	)
+
+	t.Run("7/date-trunc-postgres", func(t *testing.T) {
+		got, err := codegen.SelectExpression(month, "postgres")
+		if err != nil || got != "DATE_TRUNC('month', created_at)" {
+			t.Fatalf("postgres grain: got %q err %v", got, err)
+		}
+	})
+	t.Run("7/date-trunc-bigquery", func(t *testing.T) {
+		got, err := codegen.SelectExpression(month, "bigquery")
+		if err != nil || got != "DATE_TRUNC(created_at, MONTH)" {
+			t.Fatalf("bigquery grain: got %q err %v", got, err)
+		}
+	})
+	t.Run("7/extract-interval-timezone", func(t *testing.T) {
+		pending(t, "7", "EXTRACT / interval / timezone rewrites not modelled yet")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §8 Subquery / CTE strategy  (all codegen)
+// ---------------------------------------------------------------------------
+
+func TestSubqueryCTE(t *testing.T) {
+	for _, id := range []string{"8/inline-subquery", "8/cte", "8/cte-vs-subquery-choice", "8/nested-cte", "8/recursive-cte", "8/push-predicate-into-cte"} {
+		t.Run(id, func(t *testing.T) { pending(t, id, "subquery/CTE emission not implemented (codegen)") })
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §9 NULL handling
+// ---------------------------------------------------------------------------
+
+func TestNullHandling(t *testing.T) {
+	// §9 — IS NULL / IS NOT NULL carry a nil value (also covered in §1.1).
+	t.Run("9/is-null-predicate", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{{Field: "orders.status", Op: "IS NULL"}},
+		}
+		plan := mustPlan(t, q)
+		filters := nodesOf[*planner.FilterNode](plan)
+		if len(filters) != 1 || filters[0].Predicates[0].Value != nil {
+			t.Fatalf("IS NULL should carry a nil value, got %+v", filters)
+		}
+	})
+	t.Run("9/count-col-vs-star-render", func(t *testing.T) {
+		pending(t, "9", "COUNT(col) vs COUNT(*) NULL semantics rendering not implemented (codegen)")
+	})
+	t.Run("9/anti-join-null-check", func(t *testing.T) {
+		pending(t, "9", "LEFT JOIN ... IS NULL anti-join pattern not implemented")
+	})
+	t.Run("9/null-safe-equality", func(t *testing.T) {
+		pending(t, "9", "IS NOT DISTINCT FROM / <=> rendering not implemented (codegen)")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §10 Window functions  (need IR support)
+// ---------------------------------------------------------------------------
+
+func TestWindowFunctions(t *testing.T) {
+	for _, id := range []string{"10/row-number", "10/rank", "10/running-sum", "10/moving-average", "10/filter-on-window"} {
+		t.Run(id, func(t *testing.T) { pending(t, id, "query IR has no window-function construct") })
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §11 Dialect-specific rewrites
+// ---------------------------------------------------------------------------
+
+func TestDialectRewrites(t *testing.T) {
+	// §11 — dialect dispatch is live: an unknown dialect is a hard error,
+	// while recognised dialects report "pending" (ErrNotImplemented).
+	simple := mustPlan(t, &query.Query{Metrics: []string{"orders.revenue"}})
+
+	t.Run("11/unknown-dialect-error", func(t *testing.T) {
+		if _, err := codegen.Compile(simple, "mysql"); err == nil {
+			t.Fatal("unknown dialect should error")
+		} else if errors.Is(err, codegen.ErrNotImplemented) {
+			t.Fatal("unknown dialect should not report ErrNotImplemented")
+		}
+	})
+	t.Run("11/recognised-dialect-dispatch", func(t *testing.T) {
+		for _, d := range codegen.SupportedDialects {
+			if _, err := codegen.Compile(simple, d); !errors.Is(err, codegen.ErrNotImplemented) {
+				t.Errorf("dialect %q: want ErrNotImplemented (pending emitter), got %v", d, err)
+			}
+		}
+	})
+	t.Run("11/identifier-quoting", func(t *testing.T) {
+		pending(t, "11.1", "identifier quoting not implemented (codegen)")
+	})
+	t.Run("11/table-path", func(t *testing.T) {
+		pending(t, "11.1", "schema vs project.dataset table path not implemented (codegen)")
+	})
+	t.Run("11/casts-and-string-fns", func(t *testing.T) {
+		pending(t, "11.2-11.4", "CAST / CONCAT / boolean rendering not implemented (codegen)")
+	})
+	t.Run("11/unnest", func(t *testing.T) {
+		pending(t, "11.6", "UNNEST not modelled yet")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §12 Expression passthrough  (live via SelectExpression)
+// ---------------------------------------------------------------------------
+
+func TestExpressionPassthrough(t *testing.T) {
+	// §12 — exact-dialect match wins.
+	t.Run("12/verbatim-target-dialect", func(t *testing.T) {
+		e := dx([2]string{"ANSI_SQL", "ansi"}, [2]string{"POSTGRES", "pg"}, [2]string{"BIGQUERY", "bq"})
+		if got, _ := codegen.SelectExpression(e, "postgres"); got != "pg" {
+			t.Errorf("want exact postgres expr 'pg', got %q", got)
+		}
+		if got, _ := codegen.SelectExpression(e, "bigquery"); got != "bq" {
+			t.Errorf("want exact bigquery expr 'bq', got %q", got)
+		}
+	})
+
+	// §12 — ANSI_SQL fallback when the target dialect is absent.
+	t.Run("12/ansi-fallback", func(t *testing.T) {
+		e := ax("ansi_only")
+		got, err := codegen.SelectExpression(e, "bigquery")
+		if err != nil || got != "ansi_only" {
+			t.Fatalf("want ANSI fallback 'ansi_only', got %q err %v", got, err)
+		}
+	})
+
+	// §12 — error when neither the dialect nor ANSI_SQL is present.
+	t.Run("12/missing-dialect-error", func(t *testing.T) {
+		e := dx([2]string{"SNOWFLAKE", "snow"})
+		if _, err := codegen.SelectExpression(e, "postgres"); err == nil {
+			t.Fatal("missing dialect + no ANSI fallback should error")
+		}
+	})
+
+	t.Run("12/nested-expression-reference", func(t *testing.T) {
+		pending(t, "12", "field-references-field expression nesting not modelled yet")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §13 ORDER BY
+// ---------------------------------------------------------------------------
+
+func TestOrderBy(t *testing.T) {
+	// §13 — directions are carried, and an empty direction normalises to ASC.
+	t.Run("13/directions-and-default", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.revenue"},
+			Dimensions: []string{"orders.status"},
+			OrderBy: []query.OrderItem{
+				{Field: "orders.revenue", Direction: "DESC"},
+				{Field: "orders.status"}, // no direction -> ASC
+			},
+		}
+		plan := mustPlan(t, q)
+		orders := nodesOf[*planner.OrderNode](plan)
+		if len(orders) != 1 || len(orders[0].Items) != 2 {
+			t.Fatalf("want 1 OrderNode with 2 items, got %+v", orders)
+		}
+		if orders[0].Items[0].Direction != "DESC" || orders[0].Items[1].Direction != "ASC" {
+			t.Errorf("directions: want [DESC ASC], got %+v", orders[0].Items)
+		}
+	})
+	t.Run("13/nulls-first-last", func(t *testing.T) {
+		pending(t, "13", "query IR has no NULLS FIRST/LAST control")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// §14 Safety rules
+// ---------------------------------------------------------------------------
+
+func TestSafetyRules(t *testing.T) {
+	// §14 — two datasets with no relationship path is an error (no cartesian).
+	t.Run("14/no-cartesian-product", func(t *testing.T) {
+		m := disconnectedModel()
+		_, err := planner.Plan(&query.Query{Metrics: []string{"a.cnt"}, Dimensions: []string{"b.y"}}, m)
+		if err == nil {
+			t.Fatal("disconnected datasets should error, got nil")
+		}
+	})
+
+	// §14 — a relationship cycle must not hang BFS; the plan still resolves.
+	t.Run("14/cyclic-join-path-terminates", func(t *testing.T) {
+		m := cyclicModel()
+		_, err := planner.Plan(&query.Query{Metrics: []string{"a.cnt"}, Dimensions: []string{"b.x", "c.y"}}, m)
+		if err != nil {
+			t.Fatalf("cyclic graph should still resolve, got %v", err)
+		}
+	})
+
+	t.Run("14/ambiguous-column-error", func(t *testing.T) {
+		pending(t, "14", "ambiguous-column detection not implemented (codegen qualification)")
+	})
+}
