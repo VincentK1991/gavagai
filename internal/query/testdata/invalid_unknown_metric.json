@@ -1,0 +1,4 @@
+{
+  "metrics":    ["orders.nonexistent_metric"],
+  "dimensions": ["orders.region"]
+}

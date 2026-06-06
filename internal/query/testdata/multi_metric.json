@@ -1,0 +1,8 @@
+{
+  "metrics":    ["orders.revenue", "orders.order_count", "orders.avg_order_value"],
+  "dimensions": ["orders.region", "orders.status"],
+  "order_by": [
+    { "field": "orders.revenue",     "direction": "DESC" },
+    { "field": "orders.order_count", "direction": "ASC"  }
+  ]
+}

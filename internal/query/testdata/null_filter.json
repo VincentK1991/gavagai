@@ -1,0 +1,7 @@
+{
+  "metrics":    ["orders.order_count"],
+  "dimensions": ["orders.region"],
+  "filters": [
+    { "field": "orders.region", "op": "IS NOT NULL" }
+  ]
+}

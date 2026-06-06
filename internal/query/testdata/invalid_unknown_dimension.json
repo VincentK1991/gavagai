@@ -1,0 +1,4 @@
+{
+  "metrics":    ["orders.revenue"],
+  "dimensions": ["orders.nonexistent_column"]
+}

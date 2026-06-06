@@ -1,0 +1,6 @@
+{
+  "metrics": ["orders.revenue"],
+  "filters": [
+    { "field": "orders.nonexistent_column", "op": "=", "value": "foo" }
+  ]
+}

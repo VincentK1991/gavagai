@@ -1,0 +1,15 @@
+{
+  "metrics":    ["orders.revenue", "orders.order_count"],
+  "dimensions": ["customers.region", "customers.tier"],
+  "filters": [
+    { "field": "customers.tier", "op": "IN", "value": ["gold", "silver"] },
+    { "field": "orders.status",  "op": "=",  "value": "complete" }
+  ],
+  "having": [
+    { "metric": "orders.revenue", "op": ">=", "value": 500 }
+  ],
+  "order_by": [
+    { "field": "orders.revenue", "direction": "DESC" }
+  ],
+  "limit": 20
+}

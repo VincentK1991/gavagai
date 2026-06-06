@@ -1,0 +1,4 @@
+{
+  "metrics":    ["orders.revenue"],
+  "dimensions": ["orders.order_id"]
+}

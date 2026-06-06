@@ -1,0 +1,243 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - name: ecommerce
+    description: >
+      E-commerce analytics model backed by PostgreSQL (schema: analytics).
+      Covers orders, customers, products, and order line items.
+    ai_context:
+      instructions: >
+        Use this model to answer revenue, order volume, and customer
+        segmentation questions. Prefer order-level metrics unless the
+        question is specifically about line-item quantities.
+      synonyms: [sales model, order analytics]
+
+    datasets:
+
+      - name: customers
+        source: analytics.customers
+        primary_key: [customer_id]
+        description: Customer master table. One row per customer.
+        fields:
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+            description: Surrogate primary key.
+
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
+            dimension:
+              is_time: false
+            label: Customer Region
+            description: Geographic region of the customer (EMEA, APAC, AMER).
+            ai_context:
+              synonyms: [geography, area, customer geography]
+
+          - name: tier
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: tier
+            dimension:
+              is_time: false
+            label: Customer Tier
+            description: Loyalty tier — gold, silver, or standard.
+            ai_context:
+              synonyms: [loyalty tier, customer segment]
+
+          - name: created_at
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: created_at
+            dimension:
+              is_time: true
+            label: Customer Since
+            description: Timestamp when the customer record was created.
+
+      - name: orders
+        source: analytics.orders
+        primary_key: [order_id]
+        description: >
+          One row per customer order. Join to customers via customer_id.
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+            description: Surrogate primary key.
+
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+            description: Foreign key to customers.customer_id.
+
+          - name: status
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: status
+            dimension:
+              is_time: false
+            label: Order Status
+            description: Lifecycle status — pending, complete, cancelled, or refunded.
+            ai_context:
+              synonyms: [order state, fulfilment status]
+
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
+            dimension:
+              is_time: false
+            label: Order Region
+            description: Region in which the order was placed.
+            ai_context:
+              synonyms: [order geography, sale region]
+
+          - name: order_date
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_date
+            dimension:
+              is_time: true
+            label: Order Date
+            description: Calendar date the order was placed.
+            ai_context:
+              synonyms: [sale date, purchase date]
+
+      - name: products
+        source: analytics.products
+        primary_key: [product_id]
+        description: Product catalogue. One row per product.
+        fields:
+          - name: product_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: product_id
+            description: Surrogate primary key.
+
+          - name: category
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: category
+            dimension:
+              is_time: false
+            label: Product Category
+            description: Top-level product category (electronics, apparel, home, food).
+            ai_context:
+              synonyms: [product type, item category]
+
+          - name: name
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: name
+            dimension:
+              is_time: false
+            label: Product Name
+
+      - name: order_items
+        source: analytics.order_items
+        primary_key: [order_item_id]
+        description: >
+          One row per product line within an order.
+          WARNING: joining order_items back to orders is many-to-one from
+          items perspective but one-to-many from orders perspective — using
+          an order-level metric (e.g. revenue) across this join causes
+          fan-out (double-counting). The compiler will detect and refuse this.
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+            description: Foreign key to orders.order_id.
+
+          - name: product_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: product_id
+            description: Foreign key to products.product_id.
+
+          - name: quantity
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: quantity
+            description: Number of units in this line item.
+
+    relationships:
+      - name: orders_to_customers
+        from: orders
+        to: customers
+        from_columns: [customer_id]
+        to_columns: [customer_id]
+        ai_context:
+          synonyms: [order customer, customer orders]
+
+      - name: order_items_to_orders
+        from: order_items
+        to: orders
+        from_columns: [order_id]
+        to_columns: [order_id]
+
+      - name: order_items_to_products
+        from: order_items
+        to: products
+        from_columns: [product_id]
+        to_columns: [product_id]
+
+    metrics:
+      - name: revenue
+        description: >
+          Total order revenue. Sums the amount column on the orders table.
+          Do NOT use across the order_items join — this will fan-out.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(orders.amount)
+        ai_context:
+          synonyms: [total revenue, sales, gross revenue, gmv]
+
+      - name: order_count
+        description: Number of distinct orders.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COUNT(DISTINCT orders.order_id)
+        ai_context:
+          synonyms: [number of orders, orders placed, order volume]
+
+      - name: avg_order_value
+        description: Average revenue per order.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: AVG(orders.amount)
+        ai_context:
+          synonyms: [AOV, average basket size]
+
+      - name: total_items_sold
+        description: >
+          Total quantity of line items sold across all orders.
+          Source: order_items. Only valid in queries that do NOT also request
+          an orders-level metric — combining both triggers fan-out detection.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(order_items.quantity)
+        ai_context:
+          synonyms: [units sold, item volume, quantity sold]

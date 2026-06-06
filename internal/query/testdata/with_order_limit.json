@@ -1,0 +1,11 @@
+{
+  "metrics":    ["orders.revenue"],
+  "dimensions": ["orders.order_date"],
+  "filters": [
+    { "field": "orders.status", "op": "=", "value": "complete" }
+  ],
+  "order_by": [
+    { "field": "orders.order_date", "direction": "ASC" }
+  ],
+  "limit": 365
+}

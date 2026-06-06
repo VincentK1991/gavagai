@@ -1,0 +1,10 @@
+{
+  "metrics":    ["orders.revenue"],
+  "dimensions": ["orders.region"],
+  "having": [
+    { "metric": "orders.revenue", "op": ">", "value": 1000 }
+  ],
+  "order_by": [
+    { "field": "orders.revenue", "direction": "DESC" }
+  ]
+}

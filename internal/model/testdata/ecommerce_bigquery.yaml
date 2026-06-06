@@ -1,0 +1,200 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - name: ecommerce
+    description: >
+      E-commerce analytics model backed by BigQuery
+      (project: my_project, dataset: analytics).
+      Structurally identical to the Postgres model; sources use
+      fully-qualified BigQuery table paths.
+    ai_context:
+      instructions: >
+        Use this model to answer revenue, order volume, and customer
+        segmentation questions against the BigQuery warehouse.
+      synonyms: [sales model, order analytics]
+
+    datasets:
+
+      - name: customers
+        source: my_project.analytics.customers
+        primary_key: [customer_id]
+        description: Customer master table. One row per customer.
+        fields:
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
+            dimension:
+              is_time: false
+            label: Customer Region
+            description: Geographic region of the customer (EMEA, APAC, AMER).
+
+          - name: tier
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: tier
+            dimension:
+              is_time: false
+            label: Customer Tier
+            description: Loyalty tier — gold, silver, or standard.
+
+          - name: created_at
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: created_at
+            dimension:
+              is_time: true
+            label: Customer Since
+
+      - name: orders
+        source: my_project.analytics.orders
+        primary_key: [order_id]
+        description: One row per customer order.
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+            description: Foreign key to customers.customer_id.
+
+          - name: status
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: status
+            dimension:
+              is_time: false
+            label: Order Status
+
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
+            dimension:
+              is_time: false
+            label: Order Region
+
+          - name: order_date
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_date
+            dimension:
+              is_time: true
+            label: Order Date
+
+      - name: products
+        source: my_project.analytics.products
+        primary_key: [product_id]
+        description: Product catalogue.
+        fields:
+          - name: product_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: product_id
+
+          - name: category
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: category
+            dimension:
+              is_time: false
+            label: Product Category
+
+          - name: name
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: name
+            dimension:
+              is_time: false
+            label: Product Name
+
+      - name: order_items
+        source: my_project.analytics.order_items
+        primary_key: [order_item_id]
+        description: One row per product line within an order.
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+
+          - name: product_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: product_id
+
+          - name: quantity
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: quantity
+
+    relationships:
+      - name: orders_to_customers
+        from: orders
+        to: customers
+        from_columns: [customer_id]
+        to_columns: [customer_id]
+
+      - name: order_items_to_orders
+        from: order_items
+        to: orders
+        from_columns: [order_id]
+        to_columns: [order_id]
+
+      - name: order_items_to_products
+        from: order_items
+        to: products
+        from_columns: [product_id]
+        to_columns: [product_id]
+
+    metrics:
+      - name: revenue
+        description: Total order revenue.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(orders.amount)
+
+      - name: order_count
+        description: Number of distinct orders.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COUNT(DISTINCT orders.order_id)
+
+      - name: avg_order_value
+        description: Average revenue per order.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: AVG(orders.amount)
+
+      - name: total_items_sold
+        description: Total quantity of line items sold.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(order_items.quantity)

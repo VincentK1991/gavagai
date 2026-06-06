@@ -1,0 +1,12 @@
+{
+  "metrics":    ["orders.revenue", "orders.order_count"],
+  "dimensions": ["orders.status", "orders.region"],
+  "filters": [
+    { "field": "orders.status", "op": "IN",  "value": ["complete", "pending"] },
+    { "field": "orders.region", "op": "!=",  "value": "APAC" }
+  ],
+  "order_by": [
+    { "field": "orders.revenue", "direction": "DESC" }
+  ],
+  "limit": 50
+}
