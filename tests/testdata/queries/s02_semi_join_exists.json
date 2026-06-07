@@ -1,0 +1,1 @@
+{"metrics":["orders.order_count"],"dimensions":["orders.region"],"filters":[{"field":"customers.tier","op":"=","value":"gold"}]}

@@ -1,0 +1,1 @@
+{"metrics":["orders.order_count"],"dimensions":["customers.region"],"filters":[{"field":"orders.status","op":"IS NOT NULL"}]}

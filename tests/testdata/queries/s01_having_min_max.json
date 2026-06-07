@@ -1,0 +1,1 @@
+{"metrics":["orders.max_amount","orders.min_amount"],"dimensions":["orders.status"],"having":[{"metric":"orders.max_amount","op":">","value":1000}]}

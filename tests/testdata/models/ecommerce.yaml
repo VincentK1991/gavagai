@@ -1,0 +1,374 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - name: ecommerce
+    description: >
+      Comprehensive e-commerce analytics model used by the pushdown-checklist
+      regression and unit tests. Covers orders, customers, products, and order
+      line items with dialect-split expressions for §6, §7, and §9 tests.
+
+    datasets:
+
+      - name: customers
+        source: analytics.customers
+        primary_key: [customer_id]
+        description: Customer master table. One row per customer.
+        fields:
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
+            dimension:
+              is_time: false
+
+          - name: tier
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: tier
+            dimension:
+              is_time: false
+
+          # §9 coalesce groupby — COALESCE in GROUP BY key renders correctly
+          - name: region_coalesced
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "COALESCE(region, 'unknown')"
+            dimension:
+              is_time: false
+
+      - name: orders
+        source: analytics.orders
+        primary_key: [order_id]
+        description: >
+          One row per customer order. Join to customers via customer_id.
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+
+          - name: amount
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: amount
+
+          - name: status
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: status
+            dimension:
+              is_time: false
+
+          - name: region
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: region
+            dimension:
+              is_time: false
+
+          - name: created_at
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: created_at
+            dimension:
+              is_time: true
+
+          # DATE_TRUNC grains with dialect-split argument order
+          - name: order_month
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "DATE_TRUNC('month', created_at)"
+                - dialect: POSTGRES
+                  expression: "DATE_TRUNC('month', created_at)"
+                - dialect: BIGQUERY
+                  expression: DATE_TRUNC(created_at, MONTH)
+            dimension:
+              is_time: true
+
+          - name: order_quarter
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "DATE_TRUNC('quarter', created_at)"
+                - dialect: POSTGRES
+                  expression: "DATE_TRUNC('quarter', created_at)"
+                - dialect: BIGQUERY
+                  expression: DATE_TRUNC(created_at, QUARTER)
+            dimension:
+              is_time: true
+
+          - name: order_year
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "DATE_TRUNC('year', created_at)"
+                - dialect: POSTGRES
+                  expression: "DATE_TRUNC('year', created_at)"
+                - dialect: BIGQUERY
+                  expression: DATE_TRUNC(created_at, YEAR)
+            dimension:
+              is_time: true
+
+          # §7 extract-dow — EXTRACT(DOW) PG vs EXTRACT(DAYOFWEEK) BQ
+          - name: order_dow
+            expression:
+              dialects:
+                - dialect: POSTGRES
+                  expression: EXTRACT(DOW FROM created_at)
+                - dialect: BIGQUERY
+                  expression: EXTRACT(DAYOFWEEK FROM created_at)
+            dimension:
+              is_time: true
+
+          # §7 date-arithmetic — interval arithmetic dialect split
+          - name: order_next_week
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "created_at + INTERVAL '7 days'"
+                - dialect: POSTGRES
+                  expression: "created_at + INTERVAL '7 days'"
+                - dialect: BIGQUERY
+                  expression: DATE_ADD(created_at, INTERVAL 7 DAY)
+            dimension:
+              is_time: true
+
+          # §7 timezone — AT TIME ZONE vs DATETIME(..., tz)
+          - name: order_utc
+            expression:
+              dialects:
+                - dialect: POSTGRES
+                  expression: "created_at AT TIME ZONE 'UTC'"
+                - dialect: BIGQUERY
+                  expression: "DATETIME(created_at, 'UTC')"
+            dimension:
+              is_time: true
+
+          # §6.1 basic CASE WHEN dimension
+          - name: status_label
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "CASE WHEN status = 'complete' THEN 'done' ELSE 'pending' END"
+            dimension:
+              is_time: false
+
+          # §6.1 nested CASE WHEN dimension
+          - name: status_label_nested
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "CASE WHEN status = 'complete' THEN CASE WHEN amount > 100 THEN 'big done' ELSE 'small done' END ELSE 'pending' END"
+            dimension:
+              is_time: false
+
+          # §6.1 CASE WHEN col IS NULL branch
+          - name: status_or_unknown
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "CASE WHEN status IS NULL THEN 'unknown' ELSE status END"
+            dimension:
+              is_time: false
+
+          # §6.3 CASE WHEN as a filterable boolean dim
+          - name: is_large_order
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "CASE WHEN amount > 1000 THEN 1 ELSE 0 END"
+            dimension:
+              is_time: false
+
+      - name: order_items
+        source: analytics.order_items
+        primary_key: [order_item_id]
+        description: >
+          One row per product line within an order.
+          WARNING: joining order_items back to orders is many-to-one from
+          the items perspective but one-to-many from the orders perspective —
+          using an order-level metric (e.g. revenue) across this join causes
+          fan-out (double-counting). The compiler will detect and refuse this.
+        fields:
+          - name: order_item_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_item_id
+
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+
+          - name: product_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: product_id
+
+          - name: quantity
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: quantity
+
+          - name: price
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: price
+
+      - name: products
+        source: analytics.products
+        primary_key: [product_id]
+        description: Product catalogue. One row per product.
+        fields:
+          - name: product_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: product_id
+            dimension:
+              is_time: false
+
+          - name: category
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: category
+            dimension:
+              is_time: false
+
+          - name: name
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: name
+            dimension:
+              is_time: false
+
+    relationships:
+      - name: orders_to_customers
+        from: orders
+        to: customers
+        from_columns: [customer_id]
+        to_columns: [customer_id]
+
+      - name: order_items_to_orders
+        from: order_items
+        to: orders
+        from_columns: [order_id]
+        to_columns: [order_id]
+
+      - name: order_items_to_products
+        from: order_items
+        to: products
+        from_columns: [product_id]
+        to_columns: [product_id]
+
+    metrics:
+      - name: revenue
+        description: Total order revenue. SUM of the amount column on the orders table.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(orders.amount)
+
+      - name: order_count
+        description: Number of distinct orders (COUNT DISTINCT — fan-out safe).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COUNT(DISTINCT orders.order_id)
+
+      - name: item_count
+        description: Total row count (COUNT *).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COUNT(*)
+
+      - name: avg_order_value
+        description: Average revenue per order.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: AVG(orders.amount)
+
+      - name: max_amount
+        description: Maximum order amount (fan-out safe).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MAX(orders.amount)
+
+      - name: min_amount
+        description: Minimum order amount (fan-out safe).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: MIN(orders.amount)
+
+      - name: completed_revenue
+        description: Revenue from completed orders only.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "SUM(CASE WHEN orders.status = 'complete' THEN orders.amount ELSE 0 END)"
+
+      - name: completed_count
+        description: Count of completed orders.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "COUNT(CASE WHEN orders.status = 'complete' THEN 1 END)"
+
+      - name: avg_completed
+        description: Average amount of completed orders.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "AVG(CASE WHEN orders.status = 'complete' THEN orders.amount END)"
+
+      - name: gross_revenue
+        description: Gross revenue from order_items (price * quantity).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(order_items.price * order_items.quantity)
+
+      - name: priced_lines
+        description: Count of order_items with a non-null price (COUNT(col) excludes NULLs).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COUNT(order_items.price)
+
+      - name: safe_ratio
+        description: Revenue divided by row count, guarded by NULLIF.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "SUM(orders.amount) / NULLIF(COUNT(*), 0)"

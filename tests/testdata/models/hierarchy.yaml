@@ -1,0 +1,75 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - name: org_hierarchy
+    description: >
+      Organisational hierarchy model used by §2.2 self-join tests (all PENDING).
+      The employees-to-manager relationship is a self-join (from == to), which
+      the planner does not yet support. When self-joins are implemented the
+      compiler should assign distinct aliases (e.g. e1, e2) to each side.
+
+    datasets:
+
+      - name: employees
+        source: hr.employees
+        primary_key: [employee_id]
+        description: One row per employee.
+        fields:
+          - name: employee_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: employee_id
+
+          - name: manager_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: manager_id
+
+          - name: name
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: name
+            dimension:
+              is_time: false
+
+          - name: department
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: department
+            dimension:
+              is_time: false
+
+          - name: salary
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: salary
+
+    relationships:
+      # NOTE: self-join (from == to) is not yet supported by the planner.
+      # When supported, this should produce:
+      #   FROM hr.employees AS e1 LEFT JOIN hr.employees AS e2
+      #     ON e1.manager_id = e2.employee_id
+      - name: employee_to_manager
+        from: employees
+        to: employees
+        from_columns: [manager_id]
+        to_columns: [employee_id]
+
+    metrics:
+      - name: headcount
+        description: Total number of employees.
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COUNT(*)
+
+      - name: total_salary
+        description: Sum of all employee salaries (unsafe — fan-out if joined).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: SUM(employees.salary)
