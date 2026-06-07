@@ -25,6 +25,10 @@ const (
 	// LeftJoin preserves all rows from the left (fact) input. gavagai uses
 	// LEFT joins by default so dimension lookups never drop fact rows.
 	LeftJoin JoinKind = "LEFT"
+	// CrossJoin combines every row of each side. It carries no ON condition and
+	// is used to combine independent single-row pre-aggregates that share no
+	// grouping dimension.
+	CrossJoin JoinKind = "CROSS"
 )
 
 // ColumnRef is a reference to a physical column within a dataset (by its
@@ -146,6 +150,56 @@ type LimitNode struct {
 	Offset   int
 }
 
+// SubqueryNode renders Input as a parenthesised derived table aliased as Alias
+// and used as a FROM/JOIN source: (SELECT ... ) AS alias. Because PushDown has
+// already relocated a dataset's predicates directly above its ScanNode,
+// wrapping that filtered scan in a SubqueryNode evaluates the predicate inside
+// the subquery rather than the outer query — the predicate-pushdown-into-
+// subquery rewrite.
+type SubqueryNode struct {
+	Input PlanNode
+	Alias string
+}
+
+// CTERef references a named common table expression as a table source, rendered
+// as `cte AS alias`. The CTE body lives in the enclosing WithNode.
+type CTERef struct {
+	Name  string
+	Alias string
+}
+
+// CTEDef is one named common table expression: Name AS (Query).
+type CTEDef struct {
+	Name  string
+	Query PlanNode
+}
+
+// WithNode prepends one or more CTE definitions to Body and renders as
+// `WITH name AS (...), ... <Body>`. CTEs are emitted in slice order, so a later
+// definition may reference an earlier one by CTERef (nested CTEs).
+type WithNode struct {
+	CTEs []CTEDef
+	Body PlanNode
+}
+
+// ProjectItem is one output column of a ProjectNode: it selects Column from the
+// input source aliased Source, exposing it as Alias.
+type ProjectItem struct {
+	Source string // input source alias (a SubqueryNode alias)
+	Column string // column name within that source
+	Alias  string // output column name
+}
+
+// ProjectNode selects pre-computed columns from its input by qualified
+// reference (source.column AS alias), without re-aggregating. It is the
+// outermost node of a pre-aggregated plan: the per-grain aggregates live in the
+// input subqueries, and ProjectNode assembles their already-aggregated columns
+// into the final row shape.
+type ProjectNode struct {
+	Input PlanNode
+	Items []ProjectItem
+}
+
 func (*ScanNode) planNode()      {}
 func (*JoinNode) planNode()      {}
 func (*FilterNode) planNode()    {}
@@ -153,3 +207,7 @@ func (*AggregateNode) planNode() {}
 func (*HavingNode) planNode()    {}
 func (*OrderNode) planNode()     {}
 func (*LimitNode) planNode()     {}
+func (*SubqueryNode) planNode()  {}
+func (*CTERef) planNode()        {}
+func (*WithNode) planNode()      {}
+func (*ProjectNode) planNode()   {}

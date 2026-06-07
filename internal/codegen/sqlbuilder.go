@@ -51,15 +51,28 @@ type joinClause struct {
 type builder struct {
 	r        Renderer
 	distinct bool
-	selects  []string
-	from     string
-	joins    []joinClause
-	where    []string
-	groupBy  []string
-	having   []string
-	orderBy  []string
-	limit    *int
-	offset   int
+	// star, when true, makes render() emit `SELECT *` if no explicit select
+	// items were collected. It is set for subquery / CTE bodies, which project
+	// every column of their single base scan.
+	star    bool
+	selects []string
+	from    string
+	joins   []joinClause
+	where   []string
+	groupBy []string
+	having  []string
+	orderBy []string
+	limit   *int
+	offset  int
+	// ctes holds rendered CTE definitions from a WithNode, prepended as a WITH
+	// clause by render().
+	ctes []renderedCTE
+}
+
+// renderedCTE is a CTE definition already rendered to SQL: `name AS (body)`.
+type renderedCTE struct {
+	name string // already-quoted identifier
+	body string // the inner SELECT, not yet indented
 }
 
 // build is the recursive walker. It collects every SQL clause into the builder
@@ -126,12 +139,13 @@ func (b *builder) build(n planner.PlanNode) error {
 
 	case *planner.JoinNode:
 		// The left subtree builds the FROM clause (and any preceding JOINs for
-		// multi-hop chains). The right side always resolves to a single Scan,
-		// possibly wrapped in a FilterNode from PushDown.
+		// multi-hop chains). The right side resolves to a single source: a Scan
+		// (possibly wrapped in a FilterNode by PushDown), a SubqueryNode, or a
+		// CTERef when materialized.
 		if err := b.build(t.Left); err != nil {
 			return err
 		}
-		scan, preds, err := extractScan(t.Right)
+		table, preds, err := b.joinSourceSQL(t.Right)
 		if err != nil {
 			return err
 		}
@@ -148,18 +162,95 @@ func (b *builder) build(n planner.PlanNode) error {
 		}
 		b.joins = append(b.joins, joinClause{
 			kind:  string(t.Kind),
-			table: b.r.QuoteTable(scan.Dataset.Source) + " AS " + b.r.QuoteIdent(scan.Alias),
+			table: table,
 			on:    strings.Join(ons, " AND "),
 		})
 		return nil
+
+	case *planner.ProjectNode:
+		// Select already-aggregated columns by qualified reference, without re-
+		// aggregating. Used as the outermost node of a pre-aggregated plan.
+		for _, it := range t.Items {
+			b.selects = append(b.selects,
+				b.r.QuoteIdent(it.Source)+"."+b.r.QuoteIdent(it.Column)+" AS "+b.r.QuoteIdent(it.Alias))
+		}
+		return b.build(t.Input)
 
 	case *planner.ScanNode:
 		b.from = b.r.QuoteTable(t.Dataset.Source) + " AS " + b.r.QuoteIdent(t.Alias)
 		return nil
 
+	case *planner.SubqueryNode:
+		sub, err := emitSubBlock(t.Input, b.r)
+		if err != nil {
+			return err
+		}
+		b.from = "(\n" + indent(sub) + "\n) AS " + b.r.QuoteIdent(t.Alias)
+		return nil
+
+	case *planner.CTERef:
+		b.from = b.r.QuoteIdent(t.Name) + " AS " + b.r.QuoteIdent(t.Alias)
+		return nil
+
+	case *planner.WithNode:
+		for _, def := range t.CTEs {
+			sub, err := emitSubBlock(def.Query, b.r)
+			if err != nil {
+				return err
+			}
+			b.ctes = append(b.ctes, renderedCTE{name: b.r.QuoteIdent(def.Name), body: sub})
+		}
+		return b.build(t.Body)
+
 	default:
 		return fmt.Errorf("codegen: unsupported plan node %T", n)
 	}
+}
+
+// joinSourceSQL renders a join's right-hand source to its FROM-fragment and
+// returns any predicates that must move into the outer WHERE. A ScanNode (flat
+// strategy) keeps its pushed-down filter as WHERE; a SubqueryNode or CTERef
+// already carries its filter inside the nested block, so it contributes none.
+func (b *builder) joinSourceSQL(n planner.PlanNode) (string, []planner.Predicate, error) {
+	switch t := n.(type) {
+	case *planner.SubqueryNode:
+		sub, err := emitSubBlock(t.Input, b.r)
+		if err != nil {
+			return "", nil, err
+		}
+		return "(\n" + indent(sub) + "\n) AS " + b.r.QuoteIdent(t.Alias), nil, nil
+	case *planner.CTERef:
+		return b.r.QuoteIdent(t.Name) + " AS " + b.r.QuoteIdent(t.Alias), nil, nil
+	default:
+		scan, preds, err := extractScan(n)
+		if err != nil {
+			return "", nil, err
+		}
+		return b.r.QuoteTable(scan.Dataset.Source) + " AS " + b.r.QuoteIdent(scan.Alias), preds, nil
+	}
+}
+
+// emitSubBlock renders an inner plan (a subquery or CTE body) to a standalone
+// SELECT using a fresh builder. The body projects every column of its base
+// scan, so star is set to emit `SELECT *` when the block carries no aggregate.
+func emitSubBlock(n planner.PlanNode, r Renderer) (string, error) {
+	sb := &builder{r: r, star: true}
+	if err := sb.build(n); err != nil {
+		return "", err
+	}
+	return sb.render(), nil
+}
+
+// indent prefixes every non-empty line of s with two spaces, for nesting a
+// rendered sub-block inside parentheses or a WITH clause.
+func indent(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, ln := range lines {
+		if ln != "" {
+			lines[i] = "  " + ln
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // appendWhere renders preds into the WHERE list then recurses into input.
@@ -230,9 +321,25 @@ func extractScan(n planner.PlanNode) (*planner.ScanNode, []planner.Predicate, er
 func (b *builder) render() string {
 	var sb strings.Builder
 
-	if b.distinct {
+	// WITH prefix for hoisted CTE definitions (WithNode).
+	if len(b.ctes) > 0 {
+		sb.WriteString("WITH ")
+		for i, c := range b.ctes {
+			if i > 0 {
+				sb.WriteString(",\n")
+			}
+			sb.WriteString(c.name + " AS (\n" + indent(c.body) + "\n)")
+		}
+		sb.WriteString("\n")
+	}
+
+	switch {
+	case b.distinct:
 		sb.WriteString("SELECT DISTINCT\n")
-	} else {
+	case len(b.selects) == 0 && b.star:
+		// Subquery / CTE body over a single base scan: project all columns.
+		sb.WriteString("SELECT *")
+	default:
 		sb.WriteString("SELECT\n")
 	}
 	for i, sel := range b.selects {
@@ -245,7 +352,10 @@ func (b *builder) render() string {
 	sb.WriteString("\nFROM " + b.from)
 
 	for _, j := range b.joins {
-		sb.WriteString("\n" + j.kind + " JOIN " + j.table + "\n  ON " + j.on)
+		sb.WriteString("\n" + j.kind + " JOIN " + j.table)
+		if j.on != "" {
+			sb.WriteString("\n  ON " + j.on)
+		}
 	}
 
 	if len(b.where) > 0 {

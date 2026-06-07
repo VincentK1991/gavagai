@@ -25,6 +25,11 @@ type Options struct {
 	ModelPath string
 	QueryPath string
 	Dialect   string
+	// Materialize selects how base table sources are emitted: planner.Flat (the
+	// default zero value) keeps the single-statement form; planner.Subquery and
+	// planner.CTE push filtered scans into derived tables / WITH clauses;
+	// planner.Auto chooses between them per the reference-count rule.
+	Materialize planner.Strategy
 }
 
 // Result is the output of a successful Compile.
@@ -58,6 +63,7 @@ func Compile(opts Options) (*Result, error) {
 		return nil, err // FanOutError and join errors are already descriptive
 	}
 	plan = planner.PushDown(plan)
+	plan = planner.Materialize(plan, opts.Materialize)
 
 	sql, err := codegen.Compile(plan, opts.Dialect)
 	if err != nil {

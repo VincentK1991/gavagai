@@ -1,18 +1,30 @@
 package tests
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/vincentk1991/gavagai/internal/planner"
+)
 
 // §1 — Filter / HAVING behaviour
 
-// §1.4 — Subquery pushdown filter (PENDING: subquery codegen not implemented)
+// §1.4 — filter pushed into a CTE definition (referenced once).
 func TestCTEFilter(t *testing.T) {
-	pendingTest(t, "1.4", "cte-filter", "CTE / WITH codegen not yet implemented")
-	_ = loadQueryRaw(t, "s01_cte_filter.json")
+	sql := compileSQLStrategy(t, "ecommerce.yaml", "s01_cte_filter.json", planner.CTE)
+	assertContains(t, sql, `WITH "orders" AS (`)
+	body := sql[:strings.Index(sql, "\n)")]
+	assertContains(t, body, "WHERE status = 'complete'")
 }
 
+// §1.4 — filter pushed into an inline subquery body, not the outer query.
 func TestSubqueryFilter(t *testing.T) {
-	pendingTest(t, "1.4", "subquery-filter", "inline subquery codegen not yet implemented")
-	_ = loadQueryRaw(t, "s01_subquery_filter.json")
+	sql := compileSQLStrategy(t, "ecommerce.yaml", "s01_subquery_filter.json", planner.Subquery)
+	assertContains(t, sql, `) AS "orders"`)
+	assertContains(t, sql, "WHERE status = 'complete'")
+	if strings.Count(sql, "WHERE") != 1 {
+		t.Errorf("filter should appear once, inside the subquery:\n%s", sql)
+	}
 }
 
 // §1.5 — HAVING with safe aggregate metrics (CAN TEST NOW)

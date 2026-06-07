@@ -18,7 +18,7 @@ over an inline `(semantic model, query)` fixture.
   the assertion runs.
 
 Run the gates with `go test ./internal/conformance/... -v`. As of this commit:
-**69 boxes green, 50 pending** (see the progress table at the bottom). The green
+**80 boxes green, 39 pending** (see the progress table at the bottom). The green
 set covers the full plan-level core (Phases 0–4) plus both SQL emitters
 (Phase 5 PostgreSQL, Phase 6 BigQuery): filter/pushdown (including OR /
 mixed AND-OR disjunctions), join resolution and ON/composite-key rendering,
@@ -26,10 +26,15 @@ fan-out, GROUP BY, HAVING, ORDER BY (with NULLS FIRST/LAST), LIMIT/OFFSET,
 SELECT DISTINCT, COUNT variants (`*`, col, DISTINCT), conditional aggregates
 (SUM/COUNT/AVG of CASE), DATE_TRUNC grains, COALESCE/NULLIF, dialect-divergent
 expression passthrough (identifier quoting, CAST, string concat, boolean
-literals), and CASE WHEN/NULL rendering. The pending set is the larger
-features that need new plan-node types or codegen machinery: subquery/CTE
-emission, self/semi/anti-joins, pre-aggregation, window functions, ROLLUP/CUBE,
-and ambiguous-column qualification.
+literals), CASE WHEN/NULL rendering, subquery/CTE emission (inline derived
+tables, WITH clauses, CTE-vs-subquery selection, nested CTEs, and
+predicate-pushdown into the subquery/CTE body, via `planner.Materialize`), and
+fan-out-safe pre-aggregation (each metric aggregated on its own grain in an
+isolated subquery, combined by a shared-dimension or cross join, via
+`planner.planPreAggregated`). The pending set is the larger features that still
+need new plan-node types or codegen machinery: self/semi/anti-joins, window
+functions, ROLLUP/CUBE, recursive CTEs, nested fine→coarse aggregation, and
+ambiguous-column qualification.
 
 ---
 
@@ -56,8 +61,8 @@ and ambiguous-column qualification.
 - [x] Pushdown is idempotent: applying PushDown twice yields the same tree ← gate: `1.3/pushdown-idempotent`
 
 ### 1.4 Pushdown through subquery / CTE
-- [ ] Push filter into an inline subquery when the predicate references only its output columns
-- [ ] Push filter into a CTE definition when the CTE is referenced once and filter is safe
+- [x] Push filter into an inline subquery when the predicate references only its output columns ← gate: `1.4/into-subquery`
+- [x] Push filter into a CTE definition when the CTE is referenced once and filter is safe ← gate: `1.4/into-cte`
 
 ### 1.5 HAVING vs WHERE placement
 - [x] Scalar filter on a raw column → emitted as WHERE (pre-aggregate) ← gate: `1.5/where-vs-having`
@@ -91,9 +96,9 @@ and ambiguous-column qualification.
 - [ ] Null-safe anti-join: `NOT IN` with NULLs on right side → rewritten to `NOT EXISTS` or `LEFT JOIN ... IS NULL`
 
 ### 2.5 Fan-out-safe pre-aggregation before JOIN
-- [ ] SUM metric on the one-side dataset → pre-aggregate before join to avoid fan-out
-- [ ] AVG metric → pre-aggregate numerator and denominator separately, combine after join
-- [x] Fan-out detection raises `FanOutError` for unsafe metrics (blocks codegen until fixed) ← gate: `2.5/fan-out-detected`, `2.5/fan-out-safe-metric-ok`
+- [x] SUM metric on the one-side dataset → pre-aggregate before join to avoid fan-out ← gate: `2.5/sum-pre-aggregated`
+- [x] AVG metric → pre-aggregate, combine after join (gavagai computes AVG on its own grain, where rows are un-fanned, so no numerator/denominator split is needed) ← gate: `2.5/avg-pre-aggregated`
+- [x] Fan-out detection raises `FanOutError` for unsafe metrics when no safe pre-aggregation exists (e.g. many-to-many attribution) ← gate: `2.5/fan-out-detected`, `2.5/fan-out-safe-metric-ok`
 
 ---
 
@@ -115,9 +120,9 @@ and ambiguous-column qualification.
 - [x] `AVG(CASE WHEN status = 'complete' THEN amount END)` — conditional aggregate ← gate: `3.3/conditional-aggregate-expression`
 
 ### 3.4 Pre-aggregation (push aggregation down)
-- [ ] Push partial SUM to the inner subquery/CTE, then SUM the partial sums
-- [ ] Push COUNT DISTINCT into a subquery before joining to avoid over-count
-- [ ] Nested aggregation: inner query groups by fine grain, outer by coarse grain
+- [x] Push partial SUM to the inner subquery/CTE, then combine the partials (no outer re-aggregation needed: each grain is summed once in its own subquery) ← gate: `3.4/partial-aggregate-in-subquery`
+- [x] Push COUNT DISTINCT into a subquery before joining to avoid over-count ← gate: `3.4/count-distinct-pre-aggregated`
+- [ ] Nested aggregation: inner query groups by fine grain, outer by coarse grain (needs a metric-of-metric IR construct)
 
 ### 3.5 ROLLUP / CUBE / GROUPING SETS (future, not phase 4)
 - [ ] `GROUP BY ROLLUP(a, b)` rendered for dialects that support it
@@ -181,12 +186,12 @@ and ambiguous-column qualification.
 
 ## 8. Subquery and CTE Strategy
 
-- [ ] Inline subquery: single-use derived table emitted as `(SELECT ...) AS alias`
-- [ ] CTE: multi-use or recursive tables emitted as `WITH alias AS (SELECT ...)`
-- [ ] CTE vs subquery selection: use CTE when the same logical table is referenced >1 time
-- [ ] Nested CTEs: CTE that references another CTE
+- [x] Inline subquery: single-use derived table emitted as `(SELECT ...) AS alias` ← gate: `8/inline-subquery`
+- [x] CTE: multi-use or recursive tables emitted as `WITH alias AS (SELECT ...)` ← gate: `8/cte`
+- [x] CTE vs subquery selection: use CTE when the same logical table is referenced >1 time ← gate: `8/cte-vs-subquery-choice`
+- [x] Nested CTEs: CTE that references another CTE ← gate: `8/nested-cte`
 - [ ] Recursive CTE: hierarchical / graph traversal (future)
-- [ ] Push predicates into CTE body when the CTE is used exactly once
+- [x] Push predicates into CTE body when the CTE is used exactly once ← gate: `8/push-predicate-into-cte`
 
 ---
 
@@ -271,18 +276,18 @@ and ambiguous-column qualification.
 
 | Section | Total items | Done |
 |---------|-------------|------|
-| 1. Filter pushdown | 20 | 17 |
-| 2. JOIN rewriting | 16 | 5 |
-| 3. Aggregation rewriting | 14 | 9 |
+| 1. Filter pushdown | 20 | 19 |
+| 2. JOIN rewriting | 16 | 7 |
+| 3. Aggregation rewriting | 14 | 11 |
 | 4. DISTINCT | 5 | 1 |
 | 5. LIMIT / OFFSET | 6 | 5 |
 | 6. CASE WHEN | 10 | 7 |
 | 7. Date/time grain | 6 | 3 |
-| 8. Subquery / CTE | 6 | 0 |
+| 8. Subquery / CTE | 6 | 5 |
 | 9. NULL handling | 5 | 2 |
 | 10. Window functions | 5 | 0 |
 | 11. Dialect rewrites | 11 | 9 |
 | 12. Expression passthrough | 5 | 4 |
 | 13. ORDER BY | 5 | 5 |
 | 14. Safety rules | 5 | 2 |
-| **Total** | **119** | **69** |
+| **Total** | **119** | **80** |

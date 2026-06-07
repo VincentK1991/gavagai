@@ -21,22 +21,35 @@ func TestFanOut(t *testing.T) {
 		explanation string
 	}{
 		{
-			name: "additive metric on the one-side fans out",
-			// revenue (SUM, sourced at orders) joined to order_items (many):
-			// orders rows duplicate per line item -> double count.
+			name: "additive metric on the one-side is pre-aggregated",
+			// revenue (SUM, sourced at orders) alongside an order_items (many)
+			// metric would double-count orders across the join, so the planner
+			// pre-aggregates each grain in its own subquery and combines them.
 			query: &query.Query{
 				Metrics: []string{"orders.revenue", "order_items.total_items_sold"},
 			},
-			wantFanOut:  true,
-			explanation: "SUM(orders.amount) duplicated across order_items join",
+			wantFanOut:  false,
+			explanation: "SUM(orders.amount) pre-aggregated on the orders grain",
 		},
 		{
-			name: "avg metric on the one-side fans out",
+			name: "avg metric on the one-side is pre-aggregated",
 			query: &query.Query{
 				Metrics: []string{"orders.avg_order_value", "order_items.total_items_sold"},
 			},
+			wantFanOut:  false,
+			explanation: "AVG computed on the orders grain, immune to fan-out",
+		},
+		{
+			name: "many-to-many metric still fans out (no safe pre-aggregation)",
+			// revenue (orders) grouped by products.category forces the m2m path
+			// orders -> order_items -> products; attributing order revenue to a
+			// product category is ambiguous, so the rewrite is declined.
+			query: &query.Query{
+				Metrics:    []string{"orders.revenue"},
+				Dimensions: []string{"products.category"},
+			},
 			wantFanOut:  true,
-			explanation: "AVG is not robust to row duplication",
+			explanation: "order revenue cannot be safely attributed across a many-to-many",
 		},
 		{
 			name: "count distinct on the one-side is safe",

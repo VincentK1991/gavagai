@@ -45,18 +45,27 @@ func Plan(q *query.Query, m *model.SemanticModel) (PlanNode, error) {
 		return nil, err
 	}
 
-	if err := detectFanOut(metrics, edges); err != nil {
-		return nil, err
+	var node PlanNode
+	if ferr := detectFanOut(metrics, edges); ferr != nil {
+		// A fan-out is unsafe to compute in a single pass. Try the pre-
+		// aggregation rewrite (each metric aggregated on its own grain, results
+		// combined); fall back to the descriptive FanOutError if it declines.
+		pre, perr := planPreAggregated(m, metrics, dims, preds, havings)
+		if perr != nil {
+			return nil, ferr
+		}
+		node = pre
+	} else {
+		node = base
+		if len(preds) > 0 {
+			node = &FilterNode{Input: node, Predicates: preds}
+		}
+		node = &AggregateNode{Input: node, GroupBy: dims, Aggregates: metrics}
+		if len(havings) > 0 {
+			node = &HavingNode{Input: node, Predicates: havings}
+		}
 	}
 
-	node := base
-	if len(preds) > 0 {
-		node = &FilterNode{Input: node, Predicates: preds}
-	}
-	node = &AggregateNode{Input: node, GroupBy: dims, Aggregates: metrics}
-	if len(havings) > 0 {
-		node = &HavingNode{Input: node, Predicates: havings}
-	}
 	if len(orders) > 0 {
 		node = &OrderNode{Input: node, Items: orders}
 	}

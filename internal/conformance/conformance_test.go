@@ -261,9 +261,42 @@ func TestFilterPushdown(t *testing.T) {
 		}
 	})
 
-	// §1.4 — pushdown into subquery / CTE bodies (codegen).
+	// §1.4 — a filter referencing only a scan's own columns is pushed into the
+	// inline subquery body rather than the outer query.
 	t.Run("1.4/into-subquery", func(t *testing.T) {
-		pending(t, "1.4", "subquery/CTE emission not implemented (codegen)")
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			Filters: []query.Filter{{Field: "orders.status", Op: "=", Value: raw(`"complete"`)}},
+		}
+		sql := compileMaterialized(t, q, "postgres", planner.Subquery)
+		if !strings.Contains(sql, `) AS "orders"`) {
+			t.Fatalf("expected an inline subquery source:\n%s", sql)
+		}
+		// The WHERE must appear inside the derived table — before its closing
+		// `) AS "orders"` — and nowhere else.
+		assertInsideBlock(t, sql, "WHERE status = 'complete'", `) AS "orders"`)
+		if strings.Count(sql, "WHERE") != 1 {
+			t.Errorf("filter should appear once, inside the subquery:\n%s", sql)
+		}
+	})
+
+	// §1.4 — a filter is pushed into a CTE definition when that CTE is the only
+	// reference to the dataset.
+	t.Run("1.4/into-cte", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			Filters: []query.Filter{{Field: "orders.status", Op: "=", Value: raw(`"complete"`)}},
+		}
+		sql := compileMaterialized(t, q, "postgres", planner.CTE)
+		if !strings.Contains(sql, `WITH "orders" AS (`) {
+			t.Fatalf("expected a CTE definition:\n%s", sql)
+		}
+		// The WHERE belongs to the CTE body (before its closing paren), not the
+		// outer SELECT.
+		assertInsideBlock(t, sql, "WHERE status = 'complete'", "\n)")
+		if strings.Count(sql, "WHERE") != 1 {
+			t.Errorf("filter should appear once, inside the CTE body:\n%s", sql)
+		}
 	})
 
 	// §1.5 — scalar filter becomes WHERE; aggregate filter becomes HAVING.
@@ -387,8 +420,53 @@ func TestJoinRewriting(t *testing.T) {
 			t.Fatalf("COUNT(DISTINCT) over a fan-out join should be safe, got %v", err)
 		}
 	})
-	t.Run("2.5/pre-aggregation-rewrite", func(t *testing.T) {
-		pending(t, "2.5", "fan-out-safe pre-aggregation rewrite not implemented")
+	// §2.5 — a SUM on the one-side dataset, fanned out by a join to the many
+	// side, is pre-aggregated on its own grain before the combine: no
+	// FanOutError, and SUM is computed inside an isolated subquery.
+	t.Run("2.5/sum-pre-aggregated", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue", "order_items.gross_revenue"}}
+		plan := mustPlan(t, q)
+
+		// Shape: a Project over two aggregate subqueries (one per grain).
+		if len(nodesOf[*planner.ProjectNode](plan)) != 1 {
+			t.Fatalf("want a ProjectNode at the root of the pre-aggregated plan:\n%s", planner.Describe(plan))
+		}
+		subs := nodesOf[*planner.SubqueryNode](plan)
+		if len(subs) != 2 {
+			t.Fatalf("want one aggregate subquery per grain (2), got %d:\n%s", len(subs), planner.Describe(plan))
+		}
+		for _, s := range subs {
+			if _, ok := s.Input.(*planner.AggregateNode); !ok {
+				t.Errorf("each pre-aggregate subquery should wrap an AggregateNode, got %T", s.Input)
+			}
+		}
+
+		sql := compilePostgres(t, q)
+		// SUM(amount) is computed once, inside the orders subquery; the outer
+		// query only references the pre-computed column.
+		assertInsideBlock(t, sql, "SUM(amount)", `) AS "orders"`)
+		if !strings.Contains(sql, `"orders"."revenue" AS "revenue"`) {
+			t.Errorf("outer query should select the pre-aggregated revenue column:\n%s", sql)
+		}
+		if strings.Count(sql, "SUM(amount)") != 1 {
+			t.Errorf("revenue should be summed exactly once (no double count):\n%s", sql)
+		}
+	})
+
+	// §2.5 — an AVG that would fan out is computed on its own grain (where rows
+	// are not duplicated), so no numerator/denominator split is needed.
+	t.Run("2.5/avg-pre-aggregated", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.aov", "order_items.gross_revenue"}}
+		if err := planErr(t, q); err != nil {
+			t.Fatalf("AVG across a fan-out join should pre-aggregate, got %v", err)
+		}
+		sql := compilePostgres(t, q)
+		// AVG(amount) lives inside the orders grain subquery, computed over the
+		// un-fanned orders rows.
+		assertInsideBlock(t, sql, "AVG(amount)", `) AS "orders"`)
+		if !strings.Contains(sql, `"orders"."aov" AS "aov"`) {
+			t.Errorf("outer query should select the pre-aggregated aov column:\n%s", sql)
+		}
 	})
 }
 
@@ -491,9 +569,51 @@ func TestAggregation(t *testing.T) {
 		}
 	})
 
-	// §3.4 / §3.5
-	t.Run("3.4/pre-aggregation-pushdown", func(t *testing.T) {
-		pending(t, "3.4", "push-down of partial aggregates not implemented")
+	// §3.4 — a partial aggregate is pushed into an inner subquery, and the outer
+	// query combines the partials without re-aggregating (no SUM-of-SUM).
+	t.Run("3.4/partial-aggregate-in-subquery", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.revenue", "order_items.gross_revenue"},
+			Dimensions: []string{"orders.status"},
+		}
+		plan := mustPlan(t, q)
+
+		// Each grain's aggregate is nested inside a subquery.
+		for _, s := range nodesOf[*planner.SubqueryNode](plan) {
+			if _, ok := s.Input.(*planner.AggregateNode); !ok {
+				t.Errorf("partial aggregate should be inside a subquery, got %T", s.Input)
+			}
+		}
+		// The outer node is a projection of pre-aggregated columns, not another
+		// aggregate.
+		if _, ok := plan.(*planner.ProjectNode); !ok {
+			t.Fatalf("outer node should be a ProjectNode, got %T", plan)
+		}
+
+		sql := compilePostgres(t, q)
+		// The inner SUM appears, grouped per grain; the outer query does not wrap
+		// it in a second SUM.
+		if strings.Contains(sql, "SUM(SUM") || strings.Contains(sql, `SUM("orders"."revenue")`) {
+			t.Errorf("outer query must not re-aggregate the partial sums:\n%s", sql)
+		}
+		assertInsideBlock(t, sql, "GROUP BY status", `) AS "orders"`)
+	})
+
+	// §3.4 — COUNT(DISTINCT ...) is pushed into its grain subquery before the
+	// combine join, so it is never inflated by the fan-out.
+	t.Run("3.4/count-distinct-pre-aggregated", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue", "orders.order_count", "order_items.gross_revenue"}}
+		if err := planErr(t, q); err != nil {
+			t.Fatalf("expected pre-aggregation, got %v", err)
+		}
+		sql := compilePostgres(t, q)
+		assertInsideBlock(t, sql, "COUNT(DISTINCT order_id)", `) AS "orders"`)
+	})
+
+	// §3.4 — nested fine→coarse re-aggregation (e.g. AVG of daily SUMs) needs a
+	// metric-of-metric IR construct that does not exist yet.
+	t.Run("3.4/nested-fine-coarse", func(t *testing.T) {
+		pending(t, "3.4", "nested fine→coarse aggregation needs a metric-of-metric IR construct")
 	})
 	t.Run("3.5/rollup-cube-grouping-sets", func(t *testing.T) {
 		pending(t, "3.5", "query IR has no ROLLUP/CUBE/GROUPING SETS construct")
@@ -704,9 +824,90 @@ func TestDateGrain(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSubqueryCTE(t *testing.T) {
-	for _, id := range []string{"8/inline-subquery", "8/cte", "8/cte-vs-subquery-choice", "8/nested-cte", "8/recursive-cte", "8/push-predicate-into-cte"} {
-		t.Run(id, func(t *testing.T) { pending(t, id, "subquery/CTE emission not implemented (codegen)") })
+	// A single-source query with a pushed-down filter — the base shape used by
+	// the subquery / CTE gates.
+	filtered := &query.Query{
+		Metrics: []string{"orders.revenue"},
+		Filters: []query.Filter{{Field: "orders.status", Op: "=", Value: raw(`"complete"`)}},
 	}
+
+	// §8 — single-use derived table emitted as (SELECT ...) AS alias.
+	t.Run("8/inline-subquery", func(t *testing.T) {
+		sql := compileMaterialized(t, filtered, "postgres", planner.Subquery)
+		if !strings.Contains(sql, "FROM (\n") || !strings.Contains(sql, `) AS "orders"`) {
+			t.Errorf("expected (SELECT ...) AS \"orders\":\n%s", sql)
+		}
+		if strings.Contains(sql, "WITH ") {
+			t.Errorf("inline subquery should not emit a WITH clause:\n%s", sql)
+		}
+	})
+
+	// §8 — base table emitted as a WITH alias AS (SELECT ...) CTE.
+	t.Run("8/cte", func(t *testing.T) {
+		sql := compileMaterialized(t, filtered, "postgres", planner.CTE)
+		if !strings.Contains(sql, `WITH "orders" AS (`) {
+			t.Errorf("expected WITH \"orders\" AS (...):\n%s", sql)
+		}
+		if !strings.Contains(sql, `FROM "orders" AS "orders"`) {
+			t.Errorf("outer query should reference the CTE by name:\n%s", sql)
+		}
+	})
+
+	// §8 — Auto picks an inline subquery for a single-use dataset and a CTE when
+	// a dataset is referenced more than once.
+	t.Run("8/cte-vs-subquery-choice", func(t *testing.T) {
+		// Single use → subquery (no WITH clause).
+		single := planner.Materialize(mustPlan(t, filtered), planner.Auto)
+		if _, isWith := single.(*planner.WithNode); isWith {
+			t.Errorf("single-use dataset should choose a subquery, got a WithNode")
+		}
+		if len(nodesOf[*planner.SubqueryNode](single)) != 1 {
+			t.Errorf("single-use dataset should produce one SubqueryNode:\n%s", planner.Describe(single))
+		}
+
+		// Same dataset referenced twice → CTE. Hand-build the duplicate-reference
+		// shape the query IR cannot yet express (a self-join).
+		dup := dupReferencePlan(t)
+		got := planner.Materialize(dup, planner.Auto)
+		if _, isWith := got.(*planner.WithNode); !isWith {
+			t.Errorf("a dataset referenced twice should be hoisted into a CTE, got %T:\n%s", got, planner.Describe(got))
+		}
+	})
+
+	// §8 — a CTE definition may reference an earlier CTE (nested CTEs).
+	t.Run("8/nested-cte", func(t *testing.T) {
+		plan := nestedCTEPlan(t)
+		sql, err := codegen.Compile(plan, "postgres")
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		if !strings.Contains(sql, `WITH "orders_base" AS (`) || !strings.Contains(sql, `"orders_us" AS (`) {
+			t.Fatalf("expected two chained CTE definitions:\n%s", sql)
+		}
+		// orders_base must be defined before orders_us references it.
+		if strings.Index(sql, `WITH "orders_base"`) > strings.Index(sql, `"orders_us" AS`) {
+			t.Errorf("orders_base must be declared before orders_us:\n%s", sql)
+		}
+		if !strings.Contains(sql, `FROM "orders_base" AS "orders_base"`) {
+			t.Errorf("orders_us body should reference the orders_base CTE:\n%s", sql)
+		}
+	})
+
+	// §8 — recursive CTE (hierarchical traversal) is explicitly future work: the
+	// query IR has no anchor/recursive-term construct.
+	t.Run("8/recursive-cte", func(t *testing.T) {
+		pending(t, "8", "recursive CTE (WITH RECURSIVE) is future work; IR has no recursive-term construct")
+	})
+
+	// §8 — a single-use CTE carries the filter inside its body, not the outer
+	// query (same guarantee as §1.4/into-cte, stated as a §8 gate).
+	t.Run("8/push-predicate-into-cte", func(t *testing.T) {
+		sql := compileMaterialized(t, filtered, "postgres", planner.CTE)
+		assertInsideBlock(t, sql, "WHERE status = 'complete'", "\n)")
+		if strings.Count(sql, "WHERE") != 1 {
+			t.Errorf("filter should appear once, inside the CTE body:\n%s", sql)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/vincentk1991/gavagai/internal/codegen"
@@ -251,7 +252,16 @@ func walk(n planner.PlanNode, fn func(planner.PlanNode)) {
 		walk(t.Input, fn)
 	case *planner.LimitNode:
 		walk(t.Input, fn)
-	case *planner.ScanNode:
+	case *planner.SubqueryNode:
+		walk(t.Input, fn)
+	case *planner.ProjectNode:
+		walk(t.Input, fn)
+	case *planner.WithNode:
+		for _, c := range t.CTEs {
+			walk(c.Query, fn)
+		}
+		walk(t.Body, fn)
+	case *planner.ScanNode, *planner.CTERef:
 		// leaf
 	}
 }
@@ -274,4 +284,114 @@ func scanAliases(root planner.PlanNode) map[string]bool {
 		out[s.Alias] = true
 	}
 	return out
+}
+
+// --- materialization helpers (§1.4, §8) ------------------------------------
+
+// compileMaterialized plans+pushes down q, applies the materialization strategy
+// s, and emits SQL for the dialect.
+func compileMaterialized(t *testing.T, q *query.Query, dialect string, s planner.Strategy) string {
+	t.Helper()
+	plan := planner.Materialize(mustPlan(t, q), s)
+	sql, err := codegen.Compile(plan, dialect)
+	if err != nil {
+		t.Fatalf("Compile(%s): %v", dialect, err)
+	}
+	return sql
+}
+
+// assertInsideBlock asserts that needle occurs before the first occurrence of
+// closer — i.e. inside the nested block that closer terminates.
+func assertInsideBlock(t *testing.T, sql, needle, closer string) {
+	t.Helper()
+	ni := strings.Index(sql, needle)
+	if ni < 0 {
+		t.Errorf("expected %q in:\n%s", needle, sql)
+		return
+	}
+	ci := strings.Index(sql, closer)
+	if ci < 0 || ni > ci {
+		t.Errorf("%q should appear before %q (inside the nested block):\n%s", needle, closer, sql)
+	}
+}
+
+// datasetByName returns a pointer to the named dataset in m.
+func datasetByName(t *testing.T, m *model.SemanticModel, name string) *model.Dataset {
+	t.Helper()
+	for i := range m.Datasets {
+		if m.Datasets[i].Name == name {
+			return &m.Datasets[i]
+		}
+	}
+	t.Fatalf("dataset %q not found", name)
+	return nil
+}
+
+// fieldByName returns a pointer to the named field in ds.
+func fieldByName(t *testing.T, ds *model.Dataset, name string) *model.Field {
+	t.Helper()
+	for i := range ds.Fields {
+		if ds.Fields[i].Name == name {
+			return &ds.Fields[i]
+		}
+	}
+	t.Fatalf("field %q not found in dataset %q", name, ds.Name)
+	return nil
+}
+
+// metricByName returns a pointer to the named model-level metric.
+func metricByName(t *testing.T, m *model.SemanticModel, name string) *model.Metric {
+	t.Helper()
+	for i := range m.Metrics {
+		if m.Metrics[i].Name == name {
+			return &m.Metrics[i]
+		}
+	}
+	t.Fatalf("metric %q not found", name)
+	return nil
+}
+
+// dupReferencePlan hand-builds a plan that references the orders dataset twice
+// (a self-join shape the query IR cannot yet express) so the CTE-vs-subquery
+// choice rule can be exercised.
+func dupReferencePlan(t *testing.T) planner.PlanNode {
+	t.Helper()
+	orders := datasetByName(t, ecommerceModel(t), "orders")
+	join := &planner.JoinNode{
+		Left:  &planner.ScanNode{Dataset: orders, Alias: "orders"},
+		Right: &planner.ScanNode{Dataset: orders, Alias: "orders"},
+		Kind:  planner.LeftJoin,
+	}
+	return &planner.AggregateNode{Input: join}
+}
+
+// nestedCTEPlan hand-builds a WithNode whose second CTE (orders_us) references
+// the first (orders_base), exercising nested-CTE codegen.
+func nestedCTEPlan(t *testing.T) planner.PlanNode {
+	t.Helper()
+	m := ecommerceModel(t)
+	orders := datasetByName(t, m, "orders")
+	statusF := fieldByName(t, orders, "status")
+	amountF := fieldByName(t, orders, "amount")
+	revenue := metricByName(t, m, "revenue")
+
+	base := &planner.FilterNode{
+		Input:      &planner.ScanNode{Dataset: orders, Alias: "orders"},
+		Predicates: []planner.Predicate{{Dataset: "orders", Field: statusF, Op: "=", Value: raw(`"complete"`)}},
+	}
+	us := &planner.FilterNode{
+		Input:      &planner.CTERef{Name: "orders_base", Alias: "orders_base"},
+		Predicates: []planner.Predicate{{Dataset: "orders", Field: amountF, Op: ">", Value: raw(`100`)}},
+	}
+	body := &planner.AggregateNode{
+		Input:      &planner.CTERef{Name: "orders_us", Alias: "orders"},
+		Aggregates: []planner.MetricExpr{{Ref: "orders.revenue", Dataset: "orders", Metric: revenue}},
+	}
+	return &planner.WithNode{
+		CTEs: []planner.CTEDef{
+			{Name: "orders_base", Query: base},
+			{Name: "orders_us", Query: us},
+		},
+		Body: body,
+	}
 }

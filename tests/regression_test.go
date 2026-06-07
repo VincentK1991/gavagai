@@ -160,12 +160,30 @@ func TestReg_OrderByNullsFirst(t *testing.T) {
 
 func TestReg_FanOutRefused(t *testing.T) {
 	m := loadModel(t, "ecommerce.yaml")
-	q, err := parseQueryJSON(`{"metrics":["orders.revenue","order_items.gross_revenue"]}`)
+	// A many-to-many attribution (order revenue by product category, via
+	// order_items) has no safe pre-aggregation, so the planner still refuses it.
+	q, err := parseQueryJSON(`{"metrics":["orders.revenue"],"dimensions":["products.category"]}`)
 	if err != nil {
 		t.Fatalf("parse query: %v", err)
 	}
 	_, err = planFromResult(m, q)
 	if err == nil || !strings.Contains(err.Error(), "fan-out") {
 		t.Fatalf("expected fan-out error, got: %v", err)
+	}
+}
+
+// TestReg_FanOutPreAggregated is the companion to the refusal case: an additive
+// metric across grains is rewritten into per-grain pre-aggregates rather than
+// refused, so SUM is computed exactly once.
+func TestReg_FanOutPreAggregated(t *testing.T) {
+	m := loadModel(t, "ecommerce.yaml")
+	q, err := parseQueryJSON(`{"metrics":["orders.revenue","order_items.gross_revenue"]}`)
+	if err != nil {
+		t.Fatalf("parse query: %v", err)
+	}
+	sql := compileSQLFrom(t, m, q, "postgres")
+	assertContains(t, sql, "CROSS JOIN")
+	if strings.Count(sql, "SUM(orders.amount)") != 1 {
+		t.Fatalf("revenue must be summed exactly once (pre-aggregated):\n%s", sql)
 	}
 }

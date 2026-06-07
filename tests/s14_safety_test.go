@@ -36,20 +36,30 @@ func TestEmptyResultFilter(t *testing.T) {
 	assertContains(t, sql, "__impossible_value_xyz__")
 }
 
-// §14 — Fan-out detection: SUM(amount) on orders doubles when order_items is joined
+// §14 / §2.5 — Fan-out safety. SUM(orders.amount) would double-count when
+// order_items is joined, so the planner pre-aggregates each grain in its own
+// subquery (no double count) rather than emitting an unsafe single pass. A
+// genuinely ambiguous many-to-many attribution is still refused.
 func TestFanOutDetection(t *testing.T) {
 	m := loadModel(t, "ecommerce.yaml")
-	// orders.revenue = SUM(orders.amount) is attributed to "orders" (the "to"/one side).
-	// order_items.gross_revenue is attributed to "order_items" (the "from"/many side).
-	// Joining order_items to orders duplicates orders rows → SUM(orders.amount) double-counts.
+
+	// Additive metric across grains → pre-aggregated, SUM computed once.
 	q := &query.Query{
 		Metrics: []string{"orders.revenue", "order_items.gross_revenue"},
 	}
-	_, err := planFromResult(m, q)
-	if err == nil {
-		t.Fatal("expected fan-out error when combining orders.revenue with order_items metric, got nil")
+	sql := compileSQLFrom(t, m, q, "postgres")
+	assertContains(t, sql, "CROSS JOIN")
+	if strings.Count(sql, "SUM(orders.amount)") != 1 {
+		t.Fatalf("revenue must be summed exactly once (pre-aggregated):\n%s", sql)
 	}
-	if !strings.Contains(err.Error(), "fan-out") {
-		t.Fatalf("expected fan-out error, got: %v", err)
+
+	// Many-to-many attribution (revenue by product category) has no safe
+	// pre-aggregation and is still refused.
+	q2 := &query.Query{
+		Metrics:    []string{"orders.revenue"},
+		Dimensions: []string{"products.category"},
+	}
+	if _, err := planFromResult(m, q2); err == nil || !strings.Contains(err.Error(), "fan-out") {
+		t.Fatalf("expected fan-out error for many-to-many attribution, got: %v", err)
 	}
 }

@@ -78,6 +78,24 @@ func compileSQLFrom(t *testing.T, m *model.SemanticModel, q *query.Query, dialec
 	return sql
 }
 
+// compileSQLStrategy compiles a fixture query with a base-source materialization
+// strategy (Flat / Subquery / CTE / Auto) applied after pushdown.
+func compileSQLStrategy(t *testing.T, modelFile, queryFile string, s planner.Strategy) string {
+	t.Helper()
+	m := loadModel(t, modelFile)
+	q := loadQuery(t, queryFile)
+	plan, err := planner.Plan(q, m)
+	if err != nil {
+		t.Fatalf("planner.Plan: %v", err)
+	}
+	plan = planner.Materialize(planner.PushDown(plan), s)
+	sql, err := codegen.Compile(plan, "postgres")
+	if err != nil {
+		t.Fatalf("codegen.Compile: %v", err)
+	}
+	return sql
+}
+
 // planFromResult plans without fataling, returning the error to the caller.
 func planFromResult(m *model.SemanticModel, q *query.Query) (planner.PlanNode, error) {
 	plan, err := planner.Plan(q, m)

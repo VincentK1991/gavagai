@@ -1,5 +1,7 @@
 package planner
 
+import "strings"
+
 // Describe renders a plan tree as a compact prefix-form string, e.g.
 // "Limit(Order(Aggregate(Filter(Join(Scan(orders), Scan(customers))))))".
 // It is used by tests for shape assertions and by the CLI's --explain flag.
@@ -19,6 +21,18 @@ func Describe(n PlanNode) string {
 		return "Order(" + Describe(t.Input) + ")"
 	case *LimitNode:
 		return "Limit(" + Describe(t.Input) + ")"
+	case *SubqueryNode:
+		return "Subquery(" + Describe(t.Input) + " AS " + t.Alias + ")"
+	case *CTERef:
+		return "CTERef(" + t.Name + ")"
+	case *WithNode:
+		parts := make([]string, len(t.CTEs))
+		for i, c := range t.CTEs {
+			parts[i] = c.Name + "=" + Describe(c.Query)
+		}
+		return "With(" + strings.Join(parts, ", ") + "; " + Describe(t.Body) + ")"
+	case *ProjectNode:
+		return "Project(" + Describe(t.Input) + ")"
 	default:
 		return "?"
 	}
