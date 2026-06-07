@@ -32,22 +32,32 @@ type Query struct {
 
 	// Limit caps the number of rows returned. Nil means no LIMIT clause.
 	Limit *int `json:"limit,omitempty"`
+
+	// Offset skips the first N rows of the result. Nil means no OFFSET clause.
+	Offset *int `json:"offset,omitempty"`
 }
 
-// Filter is a predicate over a single dimension field.
+// Filter is a predicate over a single dimension field, or — when Or is
+// populated — a disjunction (OR) of leaf predicates.
 type Filter struct {
-	// Field is a "dataset.field_name" reference.
-	Field string `json:"field"`
+	// Field is a "dataset.field_name" reference. Ignored when Or is set.
+	Field string `json:"field,omitempty"`
 
 	// Op is the comparison operator. Valid values: =, !=, >, >=, <, <=, IN,
-	// NOT IN, IS NULL, IS NOT NULL.
-	Op string `json:"op"`
+	// NOT IN, IS NULL, IS NOT NULL. Ignored when Or is set.
+	Op string `json:"op,omitempty"`
 
 	// Value is the right-hand side of the predicate. It is nil for IS NULL and
 	// IS NOT NULL. For IN / NOT IN it should be a JSON array.
 	// The raw JSON is preserved so the codegen layer can render it correctly
-	// for each dialect without re-serializing.
+	// for each dialect without re-serializing. Ignored when Or is set.
 	Value json.RawMessage `json:"value,omitempty"`
+
+	// Or, when non-empty, makes this filter a disjunction group: the condition
+	// is the OR of every sub-filter, and Field/Op/Value are ignored. Sub-filters
+	// must be leaf predicates (no further nesting). Top-level filters remain
+	// AND-combined, so a group nested in the list yields `(a OR b) AND c`.
+	Or []Filter `json:"or,omitempty"`
 }
 
 // Having is a post-aggregation predicate over a metric.
@@ -69,4 +79,8 @@ type OrderItem struct {
 
 	// Direction is ASC or DESC. Empty string is treated as ASC.
 	Direction string `json:"direction,omitempty"`
+
+	// Nulls controls null ordering: FIRST, LAST, or empty for the dialect
+	// default. Rendered as NULLS FIRST / NULLS LAST.
+	Nulls string `json:"nulls,omitempty"`
 }

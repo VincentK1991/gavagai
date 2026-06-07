@@ -64,6 +64,13 @@ type Predicate struct {
 	Field   *model.Field
 	Op      string
 	Value   json.RawMessage
+
+	// Or, when non-empty, makes this a disjunction: the condition is
+	// (Or[0] OR Or[1] OR ...) and Field/Op/Value are unused. Dataset is set to
+	// the common dataset shared by every disjunct (so the group can be pushed
+	// to that scan), or "" when the disjuncts span multiple datasets — in which
+	// case the group stays above the join as a residual filter.
+	Or []Predicate
 }
 
 // HavingPredicate is a resolved post-aggregation condition over a metric.
@@ -79,6 +86,8 @@ type HavingPredicate struct {
 type OrderExpr struct {
 	Ref       string
 	Direction string
+	// Nulls is FIRST, LAST, or "" for the dialect default null ordering.
+	Nulls string
 }
 
 // ScanNode reads all rows from a single dataset.
@@ -126,10 +135,15 @@ type OrderNode struct {
 	Items []OrderExpr
 }
 
-// LimitNode caps the number of output rows.
+// LimitNode caps the number of output rows and/or skips a prefix. Count is the
+// LIMIT value and is meaningful only when HasLimit is true; Offset is the
+// OFFSET value, with 0 meaning no OFFSET. The node is present whenever the
+// query carries a LIMIT, an OFFSET, or both.
 type LimitNode struct {
-	Input PlanNode
-	Count int
+	Input    PlanNode
+	Count    int
+	HasLimit bool
+	Offset   int
 }
 
 func (*ScanNode) planNode()      {}

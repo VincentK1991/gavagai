@@ -221,6 +221,82 @@ func TestValidateOrderByRules(t *testing.T) {
 	})
 }
 
+func TestValidateLimitOffsetRules(t *testing.T) {
+	m := loadEcommerceModel(t)
+	neg := -1
+
+	t.Run("negative offset", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Offset: &neg}
+		expectErrorContaining(t, "negative offset", "offset", query.Validate(q, m))
+	})
+
+	t.Run("negative limit", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Limit: &neg}
+		expectErrorContaining(t, "negative limit", "limit", query.Validate(q, m))
+	})
+
+	t.Run("valid limit and offset", func(t *testing.T) {
+		ten, twenty := 10, 20
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Limit: &ten, Offset: &twenty}
+		expectNoErrors(t, "limit+offset", query.Validate(q, m))
+	})
+}
+
+func TestValidateOrderByNulls(t *testing.T) {
+	m := loadEcommerceModel(t)
+
+	t.Run("invalid nulls placement", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			OrderBy: []query.OrderItem{{Field: "orders.revenue", Nulls: "MIDDLE"}},
+		}
+		expectErrorContaining(t, "bad nulls", "MIDDLE", query.Validate(q, m))
+	})
+
+	t.Run("valid nulls placement", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			OrderBy: []query.OrderItem{{Field: "orders.revenue", Direction: "DESC", Nulls: "LAST"}},
+		}
+		expectNoErrors(t, "nulls last", query.Validate(q, m))
+	})
+}
+
+func TestValidateOrFilter(t *testing.T) {
+	m := loadEcommerceModel(t)
+
+	t.Run("valid OR group", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			Filters: []query.Filter{{Or: []query.Filter{
+				{Field: "orders.status", Op: "=", Value: []byte(`"complete"`)},
+				{Field: "orders.status", Op: "=", Value: []byte(`"shipped"`)},
+			}}},
+		}
+		expectNoErrors(t, "or group", query.Validate(q, m))
+	})
+
+	t.Run("nested OR rejected", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			Filters: []query.Filter{{Or: []query.Filter{
+				{Or: []query.Filter{{Field: "orders.status", Op: "=", Value: []byte(`"x"`)}}},
+			}}},
+		}
+		expectErrorContaining(t, "nested or", "nested OR", query.Validate(q, m))
+	})
+
+	t.Run("invalid field inside OR group", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			Filters: []query.Filter{{Or: []query.Filter{
+				{Field: "orders.nonexistent_col", Op: "=", Value: []byte(`"x"`)},
+			}}},
+		}
+		expectErrorContaining(t, "bad field in or", "nonexistent_col", query.Validate(q, m))
+	})
+}
+
 func TestValidateBigQueryModel(t *testing.T) {
 	doc, err := model.ParseFile(filepath.Join("..", "model", "testdata", "ecommerce_bigquery.yaml"))
 	if err != nil {

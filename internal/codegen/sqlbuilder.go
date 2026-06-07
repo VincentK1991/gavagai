@@ -59,6 +59,7 @@ type builder struct {
 	having   []string
 	orderBy  []string
 	limit    *int
+	offset   int
 }
 
 // build is the recursive walker. It collects every SQL clause into the builder
@@ -67,13 +68,21 @@ func (b *builder) build(n planner.PlanNode) error {
 	switch t := n.(type) {
 
 	case *planner.LimitNode:
-		b.limit = &t.Count
+		if t.HasLimit {
+			c := t.Count
+			b.limit = &c
+		}
+		b.offset = t.Offset
 		return b.build(t.Input)
 
 	case *planner.OrderNode:
 		for _, item := range t.Items {
 			_, name, _ := splitRef(item.Ref)
-			b.orderBy = append(b.orderBy, b.r.QuoteIdent(name)+" "+item.Direction)
+			clause := b.r.QuoteIdent(name) + " " + item.Direction
+			if item.Nulls != "" {
+				clause += " NULLS " + item.Nulls
+			}
+			b.orderBy = append(b.orderBy, clause)
 		}
 		return b.build(t.Input)
 
@@ -161,21 +170,39 @@ func (b *builder) appendWhere(preds []planner.Predicate, input planner.PlanNode)
 	return b.build(input)
 }
 
-// renderPredicatesInto resolves each predicate's field expression and appends
-// the rendered SQL condition to the WHERE list.
+// renderPredicatesInto resolves each predicate and appends the rendered SQL
+// condition to the WHERE list.
 func (b *builder) renderPredicatesInto(preds []planner.Predicate) error {
 	for _, pred := range preds {
-		expr, err := SelectExpression(pred.Field.Expression, b.r.DialectTag())
-		if err != nil {
-			return fmt.Errorf("codegen: filter field %q: %w", pred.Field.Name, err)
-		}
-		clause, err := renderPredicate(expr, pred.Op, pred.Value)
+		clause, err := b.renderOnePredicate(pred)
 		if err != nil {
 			return err
 		}
 		b.where = append(b.where, clause)
 	}
 	return nil
+}
+
+// renderOnePredicate renders a single predicate to a SQL boolean expression. A
+// disjunction (Or non-empty) is rendered as a parenthesised OR of its members;
+// a leaf resolves its field expression and renders the comparison.
+func (b *builder) renderOnePredicate(pred planner.Predicate) (string, error) {
+	if len(pred.Or) > 0 {
+		parts := make([]string, 0, len(pred.Or))
+		for _, sub := range pred.Or {
+			c, err := b.renderOnePredicate(sub)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, c)
+		}
+		return "(" + strings.Join(parts, " OR ") + ")", nil
+	}
+	expr, err := SelectExpression(pred.Field.Expression, b.r.DialectTag())
+	if err != nil {
+		return "", fmt.Errorf("codegen: filter field %q: %w", pred.Field.Name, err)
+	}
+	return renderPredicate(expr, pred.Op, pred.Value)
 }
 
 // extractScan walks through any stack of FilterNodes wrapping n, collecting
@@ -245,6 +272,10 @@ func (b *builder) render() string {
 
 	if b.limit != nil {
 		sb.WriteString(fmt.Sprintf("\nLIMIT %d", *b.limit))
+	}
+
+	if b.offset > 0 {
+		sb.WriteString(fmt.Sprintf("\nOFFSET %d", b.offset))
 	}
 
 	sb.WriteString("\n")

@@ -91,8 +91,74 @@ func TestFilterPushdown(t *testing.T) {
 		}
 	})
 
+	// §1.2 — a same-table OR group is one disjunction predicate, pushed to the
+	// scan and rendered as a parenthesised OR.
 	t.Run("1.2/OR", func(t *testing.T) {
-		pending(t, "1.2/OR", "query IR has no OR/disjunction operator yet")
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{{Or: []query.Filter{
+				{Field: "orders.status", Op: "=", Value: raw(`"complete"`)},
+				{Field: "orders.status", Op: "=", Value: raw(`"shipped"`)},
+			}}},
+		}
+		plan := mustPlan(t, q)
+		filters := nodesOf[*planner.FilterNode](plan)
+		if len(filters) != 1 || len(filters[0].Predicates) != 1 {
+			t.Fatalf("want 1 FilterNode with 1 (OR) predicate, got %+v", filters)
+		}
+		if len(filters[0].Predicates[0].Or) != 2 {
+			t.Fatalf("want an OR group of 2 disjuncts, got %+v", filters[0].Predicates[0])
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "status = 'complete' OR status = 'shipped'") {
+			t.Errorf("OR group should render as a parenthesised disjunction:\n%s", sql)
+		}
+	})
+
+	// §1.2 — a disjunction that spans datasets cannot be pushed; it stays above
+	// the join as a residual filter.
+	t.Run("1.2/OR-cross-dataset-stays-above-join", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region"},
+			Filters: []query.Filter{{Or: []query.Filter{
+				{Field: "orders.status", Op: "=", Value: raw(`"complete"`)},
+				{Field: "customers.region", Op: "=", Value: raw(`"US"`)},
+			}}},
+		}
+		plan := mustPlan(t, q)
+		// The residual filter wraps the join (it is not pushed onto a scan).
+		f, ok := plan.(*planner.AggregateNode)
+		if !ok {
+			t.Fatalf("root: want *AggregateNode, got %T", plan)
+		}
+		if _, ok := f.Input.(*planner.FilterNode); !ok {
+			t.Fatalf("cross-dataset OR should remain as a FilterNode above the join, got %T", f.Input)
+		}
+	})
+
+	// §1.2 — mixed AND/OR: conjuncts are split; the OR group and the leaf land
+	// in one FilterNode (both reference orders) and render with AND + OR.
+	t.Run("1.2/mixed-and-or", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{
+				{Or: []query.Filter{
+					{Field: "orders.status", Op: "=", Value: raw(`"complete"`)},
+					{Field: "orders.status", Op: "=", Value: raw(`"shipped"`)},
+				}},
+				{Field: "orders.amount", Op: ">", Value: raw(`100`)},
+			},
+		}
+		plan := mustPlan(t, q)
+		filters := nodesOf[*planner.FilterNode](plan)
+		if len(filters) != 1 || len(filters[0].Predicates) != 2 {
+			t.Fatalf("want 1 FilterNode with 2 predicates (OR group + leaf), got %+v", filters)
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, " OR ") || !strings.Contains(sql, " AND ") {
+			t.Errorf("mixed AND/OR should render both connectives:\n%s", sql)
+		}
 	})
 
 	// §1.3 — a filter on the left (fact) dataset is pushed below the join.
@@ -275,6 +341,26 @@ func TestJoinRewriting(t *testing.T) {
 		}
 	})
 
+	// §2.1 — the join ON condition renders as left.col = right.col.
+	t.Run("2.1/on-condition-render", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.order_count"}, Dimensions: []string{"customers.region"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, `ON "orders"."customer_id" = "customers"."customer_id"`) {
+			t.Errorf("ON condition should render as left.col = right.col:\n%s", sql)
+		}
+	})
+
+	// §2.1 — a composite join key renders its conditions joined by AND.
+	t.Run("2.1/composite-key-render", func(t *testing.T) {
+		m := compositeKeyModel()
+		q := &query.Query{Metrics: []string{"a.cnt"}, Dimensions: []string{"b.k1"}}
+		sql := compileWith(t, m, q, "postgres")
+		want := `ON "a"."k1" = "b"."k1" AND "a"."k2" = "b"."k2"`
+		if !strings.Contains(sql, want) {
+			t.Errorf("composite key ON should AND-join its conditions\nwant: %s\ngot:\n%s", want, sql)
+		}
+	})
+
 	// §2.2 self-join, §2.3 semi-join, §2.4 anti-join — not expressible yet.
 	t.Run("2.2/self-join", func(t *testing.T) {
 		pending(t, "2.2", "query IR cannot express a self-join (no per-reference alias)")
@@ -361,6 +447,27 @@ func TestAggregation(t *testing.T) {
 		}
 	})
 
+	// §3.2 — COUNT(*) renders verbatim.
+	t.Run("3.2/count-star-render", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.item_count"}, Dimensions: []string{"orders.status"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "COUNT(*)") {
+			t.Errorf("COUNT(*) should render verbatim:\n%s", sql)
+		}
+	})
+
+	// §3.2 / §9 — COUNT(col) renders verbatim (excludes NULLs, unlike COUNT(*)).
+	t.Run("3.2/count-col-render", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"order_items.priced_lines"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "COUNT(price)") {
+			t.Errorf("COUNT(col) should render verbatim:\n%s", sql)
+		}
+		if strings.Contains(sql, "COUNT(*)") {
+			t.Errorf("COUNT(col) must not collapse to COUNT(*):\n%s", sql)
+		}
+	})
+
 	// §3.3 — the conditional-aggregate expression is carried on the metric and
 	// resolves through the shared selector; embedding it in SQL is codegen.
 	// §3.3 — a CASE WHEN metric expression renders verbatim in the aggregate.
@@ -372,6 +479,15 @@ func TestAggregation(t *testing.T) {
 		sql := compilePostgres(t, q)
 		if !strings.Contains(sql, "CASE WHEN") {
 			t.Errorf("conditional aggregate should render CASE WHEN verbatim:\n%s", sql)
+		}
+	})
+
+	// §3.3 — an arbitrary expression inside an aggregate renders verbatim.
+	t.Run("3.3/aggregate-on-expression", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"order_items.gross_revenue"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "SUM(price * quantity)") {
+			t.Errorf("SUM(expr) should render the inner expression verbatim:\n%s", sql)
 		}
 	})
 
@@ -433,8 +549,21 @@ func TestLimitOffset(t *testing.T) {
 			t.Error("LIMIT must not sit directly on a Scan when an aggregate is present")
 		}
 	})
+	// §5 — OFFSET is carried on the LimitNode and rendered after LIMIT.
 	t.Run("5/offset", func(t *testing.T) {
-		pending(t, "5", "query IR has no OFFSET field")
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Limit: intp(10), Offset: intp(20)}
+		plan := mustPlan(t, q)
+		lim, ok := plan.(*planner.LimitNode)
+		if !ok {
+			t.Fatalf("root: want *LimitNode, got %T", plan)
+		}
+		if !lim.HasLimit || lim.Count != 10 || lim.Offset != 20 {
+			t.Fatalf("want LIMIT 10 OFFSET 20, got %+v", lim)
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "LIMIT 10") || !strings.Contains(sql, "OFFSET 20") {
+			t.Errorf("OFFSET should render alongside LIMIT:\n%s", sql)
+		}
 	})
 	// §5 — LIMIT n rendered correctly for PostgreSQL.
 	t.Run("5/dialect-limit-syntax", func(t *testing.T) {
@@ -442,6 +571,19 @@ func TestLimitOffset(t *testing.T) {
 		sql := compilePostgres(t, q)
 		if !strings.Contains(sql, "LIMIT 25") {
 			t.Errorf("LIMIT should render as 'LIMIT 25':\n%s", sql)
+		}
+	})
+	// §5 — both supported dialects use the `LIMIT n OFFSET m` form (PostgreSQL
+	// and BigQuery agree; MySQL/ANSI variants are out of scope).
+	t.Run("5/dialect-limit-offset-form", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Limit: intp(5), Offset: intp(15)}
+		for _, dialect := range []string{"postgres", "bigquery"} {
+			sql := compileDialect(t, q, dialect)
+			li := strings.Index(sql, "LIMIT 5")
+			oi := strings.Index(sql, "OFFSET 15")
+			if li < 0 || oi < 0 || oi < li {
+				t.Errorf("%s: want 'LIMIT 5' before 'OFFSET 15':\n%s", dialect, sql)
+			}
 		}
 	})
 }
@@ -477,11 +619,35 @@ func TestCaseWhen(t *testing.T) {
 			t.Errorf("CASE WHEN dimension should be aliased as status_label:\n%s", sql)
 		}
 	})
+	// §6.2 — SUM/COUNT/AVG over a CASE WHEN all render their conditional inner
+	// expression verbatim inside the aggregate function.
 	t.Run("6.2/case-metric-render", func(t *testing.T) {
-		pending(t, "6.2", "conditional aggregate separate test — covered by 3.3/conditional-aggregate-expression")
+		cases := []struct{ metric, fn string }{
+			{"orders.completed_revenue", "SUM(CASE WHEN"},
+			{"orders.completed_count", "COUNT(CASE WHEN"},
+			{"orders.avg_completed", "AVG(CASE WHEN"},
+		}
+		for _, c := range cases {
+			q := &query.Query{Metrics: []string{c.metric}, Dimensions: []string{"orders.status"}}
+			sql := compilePostgres(t, q)
+			if !strings.Contains(sql, c.fn) {
+				t.Errorf("%s should render %q verbatim:\n%s", c.metric, c.fn, sql)
+			}
+		}
 	})
+	// §6.4 — COALESCE in a dimension and NULLIF in a metric render verbatim.
 	t.Run("6.4/coalesce-nullif", func(t *testing.T) {
-		pending(t, "6.4", "COALESCE/NULLIF not modelled in ecommerce fixture yet")
+		dimSQL := compilePostgres(t, &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region_safe"},
+		})
+		if !strings.Contains(dimSQL, "COALESCE(region, 'unknown')") {
+			t.Errorf("COALESCE dimension should render verbatim:\n%s", dimSQL)
+		}
+		metSQL := compilePostgres(t, &query.Query{Metrics: []string{"orders.safe_ratio"}})
+		if !strings.Contains(metSQL, "NULLIF(COUNT(*), 0)") {
+			t.Errorf("NULLIF metric should render verbatim:\n%s", metSQL)
+		}
 	})
 }
 
@@ -506,6 +672,26 @@ func TestDateGrain(t *testing.T) {
 		got, err := codegen.SelectExpression(month, "bigquery")
 		if err != nil || got != "DATE_TRUNC(created_at, MONTH)" {
 			t.Fatalf("bigquery grain: got %q err %v", got, err)
+		}
+	})
+	// §7 — month / quarter / year grains all render for both dialects, with the
+	// dialect-correct DATE_TRUNC argument order.
+	t.Run("7/date-trunc-grains", func(t *testing.T) {
+		grains := []struct {
+			dim, pg, bq string
+		}{
+			{"orders.order_month", "DATE_TRUNC('month', created_at)", "DATE_TRUNC(created_at, MONTH)"},
+			{"orders.order_quarter", "DATE_TRUNC('quarter', created_at)", "DATE_TRUNC(created_at, QUARTER)"},
+			{"orders.order_year", "DATE_TRUNC('year', created_at)", "DATE_TRUNC(created_at, YEAR)"},
+		}
+		for _, g := range grains {
+			q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{g.dim}}
+			if sql := compilePostgres(t, q); !strings.Contains(sql, g.pg) {
+				t.Errorf("postgres %s: want %q:\n%s", g.dim, g.pg, sql)
+			}
+			if sql := compileBigQuery(t, q); !strings.Contains(sql, g.bq) {
+				t.Errorf("bigquery %s: want %q:\n%s", g.dim, g.bq, sql)
+			}
 		}
 	})
 	t.Run("7/extract-interval-timezone", func(t *testing.T) {
@@ -549,6 +735,17 @@ func TestNullHandling(t *testing.T) {
 		sql := compilePostgres(t, q)
 		if !strings.Contains(sql, "status IS NULL") {
 			t.Errorf("IS NULL should render as 'status IS NULL':\n%s", sql)
+		}
+	})
+	// §9 — COUNT(col) excludes NULLs and must render distinctly from COUNT(*).
+	t.Run("9/count-col-excludes-null", func(t *testing.T) {
+		colSQL := compilePostgres(t, &query.Query{Metrics: []string{"order_items.priced_lines"}})
+		if !strings.Contains(colSQL, "COUNT(price)") {
+			t.Errorf("COUNT(col) should render as COUNT(price):\n%s", colSQL)
+		}
+		starSQL := compilePostgres(t, &query.Query{Metrics: []string{"orders.item_count"}})
+		if !strings.Contains(starSQL, "COUNT(*)") {
+			t.Errorf("COUNT(*) should render as COUNT(*):\n%s", starSQL)
 		}
 	})
 	t.Run("9/anti-join-null-check", func(t *testing.T) {
@@ -677,8 +874,44 @@ func TestDialectRewrites(t *testing.T) {
 		}
 	})
 
+	// §11.2-11.4 — dialect-divergent expressions (casts, string concat) resolve
+	// via the per-dialect OSI entry, while functions that agree across dialects
+	// (UPPER, boolean literals) pass through unchanged.
 	t.Run("11/casts-and-string-fns", func(t *testing.T) {
-		pending(t, "11.2-11.4", "CAST / CONCAT / boolean rendering not modelled yet")
+		check := func(label, want, got string, err error) {
+			t.Helper()
+			if err != nil || got != want {
+				t.Errorf("%s: want %q, got %q (err %v)", label, want, got, err)
+			}
+		}
+		// §11.4 — CAST type names diverge.
+		cast := dx([2]string{"POSTGRES", "CAST(amount AS INTEGER)"}, [2]string{"BIGQUERY", "CAST(amount AS INT64)"})
+		g, e := codegen.SelectExpression(cast, "postgres")
+		check("cast/pg", "CAST(amount AS INTEGER)", g, e)
+		g, e = codegen.SelectExpression(cast, "bigquery")
+		check("cast/bq", "CAST(amount AS INT64)", g, e)
+		// §11.4 — the `::` cast shorthand is PostgreSQL-only.
+		shorthand := dx([2]string{"POSTGRES", "amount::integer"}, [2]string{"BIGQUERY", "CAST(amount AS INT64)"})
+		g, e = codegen.SelectExpression(shorthand, "postgres")
+		check("cast-shorthand/pg", "amount::integer", g, e)
+		// §11.2 — string concat: `||` (ANSI/PostgreSQL) vs CONCAT (BigQuery).
+		concat := dx([2]string{"ANSI_SQL", "first_name || last_name"}, [2]string{"BIGQUERY", "CONCAT(first_name, last_name)"})
+		g, e = codegen.SelectExpression(concat, "postgres")
+		check("concat/pg", "first_name || last_name", g, e)
+		g, e = codegen.SelectExpression(concat, "bigquery")
+		check("concat/bq", "CONCAT(first_name, last_name)", g, e)
+		// §11.2 — UPPER is identical across dialects (ANSI fallback serves both).
+		upper := ax("UPPER(region)")
+		g, e = codegen.SelectExpression(upper, "postgres")
+		check("upper/pg", "UPPER(region)", g, e)
+		g, e = codegen.SelectExpression(upper, "bigquery")
+		check("upper/bq", "UPPER(region)", g, e)
+		// §11.3 — boolean literals are identical (TRUE/FALSE) in both dialects.
+		boolean := ax("is_active = TRUE")
+		g, e = codegen.SelectExpression(boolean, "postgres")
+		check("bool/pg", "is_active = TRUE", g, e)
+		g, e = codegen.SelectExpression(boolean, "bigquery")
+		check("bool/bq", "is_active = TRUE", g, e)
 	})
 	t.Run("11/unnest", func(t *testing.T) {
 		pending(t, "11.6", "UNNEST not modelled yet")
@@ -747,8 +980,25 @@ func TestOrderBy(t *testing.T) {
 			t.Errorf("directions: want [DESC ASC], got %+v", orders[0].Items)
 		}
 	})
+	// §13 — NULLS FIRST / NULLS LAST is carried through the plan and rendered.
 	t.Run("13/nulls-first-last", func(t *testing.T) {
-		pending(t, "13", "query IR has no NULLS FIRST/LAST control")
+		q := &query.Query{
+			Metrics:    []string{"orders.revenue"},
+			Dimensions: []string{"orders.status"},
+			OrderBy: []query.OrderItem{
+				{Field: "orders.revenue", Direction: "DESC", Nulls: "LAST"},
+				{Field: "orders.status", Nulls: "FIRST"},
+			},
+		}
+		plan := mustPlan(t, q)
+		orders := nodesOf[*planner.OrderNode](plan)
+		if len(orders) != 1 || orders[0].Items[0].Nulls != "LAST" || orders[0].Items[1].Nulls != "FIRST" {
+			t.Fatalf("nulls placement not carried: %+v", orders)
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "DESC NULLS LAST") || !strings.Contains(sql, "ASC NULLS FIRST") {
+			t.Errorf("NULLS FIRST/LAST should render:\n%s", sql)
+		}
 	})
 }
 

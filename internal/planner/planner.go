@@ -60,8 +60,16 @@ func Plan(q *query.Query, m *model.SemanticModel) (PlanNode, error) {
 	if len(orders) > 0 {
 		node = &OrderNode{Input: node, Items: orders}
 	}
-	if q.Limit != nil {
-		node = &LimitNode{Input: node, Count: *q.Limit}
+	if q.Limit != nil || q.Offset != nil {
+		ln := &LimitNode{Input: node}
+		if q.Limit != nil {
+			ln.Count = *q.Limit
+			ln.HasLimit = true
+		}
+		if q.Offset != nil {
+			ln.Offset = *q.Offset
+		}
+		node = ln
 	}
 
 	return node, nil
@@ -130,17 +138,54 @@ func resolveDimensions(refs []string, idx *index) ([]DimensionExpr, error) {
 func resolveFilters(filters []query.Filter, idx *index) ([]Predicate, error) {
 	out := make([]Predicate, 0, len(filters))
 	for _, f := range filters {
-		ds, name, ok := splitRef(f.Field)
-		if !ok {
-			return nil, fmt.Errorf("plan: invalid filter field %q", f.Field)
+		if len(f.Or) > 0 {
+			group := make([]Predicate, 0, len(f.Or))
+			for _, sub := range f.Or {
+				p, err := resolveLeafFilter(sub, idx)
+				if err != nil {
+					return nil, err
+				}
+				group = append(group, p)
+			}
+			out = append(out, Predicate{Dataset: commonDataset(group), Or: group})
+			continue
 		}
-		field, err := idx.field(ds, name)
+		p, err := resolveLeafFilter(f, idx)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, Predicate{Dataset: ds, Field: field, Op: f.Op, Value: f.Value})
+		out = append(out, p)
 	}
 	return out, nil
+}
+
+// resolveLeafFilter resolves a single (non-OR) filter into a Predicate.
+func resolveLeafFilter(f query.Filter, idx *index) (Predicate, error) {
+	ds, name, ok := splitRef(f.Field)
+	if !ok {
+		return Predicate{}, fmt.Errorf("plan: invalid filter field %q", f.Field)
+	}
+	field, err := idx.field(ds, name)
+	if err != nil {
+		return Predicate{}, err
+	}
+	return Predicate{Dataset: ds, Field: field, Op: f.Op, Value: f.Value}, nil
+}
+
+// commonDataset returns the dataset shared by every predicate, or "" when they
+// reference more than one. A disjunction can be pushed to a scan only when all
+// its members live on the same dataset.
+func commonDataset(preds []Predicate) string {
+	if len(preds) == 0 {
+		return ""
+	}
+	ds := preds[0].Dataset
+	for _, p := range preds[1:] {
+		if p.Dataset != ds {
+			return ""
+		}
+	}
+	return ds
 }
 
 func resolveHaving(having []query.Having, idx *index) ([]HavingPredicate, error) {
@@ -166,7 +211,7 @@ func resolveOrderBy(items []query.OrderItem) []OrderExpr {
 		if dir == "" {
 			dir = "ASC"
 		}
-		out = append(out, OrderExpr{Ref: it.Field, Direction: dir})
+		out = append(out, OrderExpr{Ref: it.Field, Direction: dir, Nulls: it.Nulls})
 	}
 	return out
 }

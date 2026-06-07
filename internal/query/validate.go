@@ -33,6 +33,9 @@ var validHavingOps = map[string]bool{
 // validDirections is the set of accepted ORDER BY directions (empty = ASC).
 var validDirections = map[string]bool{"": true, "ASC": true, "DESC": true}
 
+// validNulls is the set of accepted NULLS placements (empty = dialect default).
+var validNulls = map[string]bool{"": true, "FIRST": true, "LAST": true}
+
 // Validate checks a Query against a SemanticModel and returns every problem
 // found. An empty slice means the query is valid against this model.
 //
@@ -105,17 +108,18 @@ func Validate(q *Query, m *model.SemanticModel) []ValidationError {
 	// Validate filters.
 	for i, f := range q.Filters {
 		path := fmt.Sprintf("filters[%d]", i)
-		validateFilterField(add, path, f.Field, datasets)
-		if !validFilterOps[f.Op] {
-			add(path, fmt.Sprintf("invalid operator %q; valid operators: %s", f.Op, sortedKeys(validFilterOps)))
+		if len(f.Or) > 0 {
+			for j, sub := range f.Or {
+				subPath := fmt.Sprintf("%s.or[%d]", path, j)
+				if len(sub.Or) > 0 {
+					add(subPath, "nested OR groups are not supported")
+					continue
+				}
+				validateLeafFilter(add, subPath, sub, datasets)
+			}
+			continue
 		}
-		isNullOp := f.Op == "IS NULL" || f.Op == "IS NOT NULL"
-		if isNullOp && len(f.Value) > 0 {
-			add(path, fmt.Sprintf("operator %q must have no value", f.Op))
-		}
-		if !isNullOp && f.Op != "" && len(f.Value) == 0 {
-			add(path, fmt.Sprintf("operator %q requires a value", f.Op))
-		}
+		validateLeafFilter(add, path, f, datasets)
 	}
 
 	// Validate HAVING.
@@ -157,9 +161,37 @@ func Validate(q *Query, m *model.SemanticModel) []ValidationError {
 		if !validDirections[ob.Direction] {
 			add(path, fmt.Sprintf("invalid direction %q; must be ASC, DESC, or empty", ob.Direction))
 		}
+		if !validNulls[ob.Nulls] {
+			add(path, fmt.Sprintf("invalid nulls %q; must be FIRST, LAST, or empty", ob.Nulls))
+		}
+	}
+
+	// Validate LIMIT / OFFSET.
+	if q.Limit != nil && *q.Limit < 0 {
+		add("limit", fmt.Sprintf("must be >= 0, got %d", *q.Limit))
+	}
+	if q.Offset != nil && *q.Offset < 0 {
+		add("offset", fmt.Sprintf("must be >= 0, got %d", *q.Offset))
 	}
 
 	return errs
+}
+
+// validateLeafFilter checks one leaf predicate (field reference, operator, and
+// value placement). It is used both for top-level filters and for the members
+// of an OR group.
+func validateLeafFilter(add func(path, msg string), path string, f Filter, datasets map[string]map[string]model.Field) {
+	validateFilterField(add, path, f.Field, datasets)
+	if !validFilterOps[f.Op] {
+		add(path, fmt.Sprintf("invalid operator %q; valid operators: %s", f.Op, sortedKeys(validFilterOps)))
+	}
+	isNullOp := f.Op == "IS NULL" || f.Op == "IS NOT NULL"
+	if isNullOp && len(f.Value) > 0 {
+		add(path, fmt.Sprintf("operator %q must have no value", f.Op))
+	}
+	if !isNullOp && f.Op != "" && len(f.Value) == 0 {
+		add(path, fmt.Sprintf("operator %q requires a value", f.Op))
+	}
 }
 
 // parseRef splits a "dataset.name" reference. It returns (dataset, name, true)

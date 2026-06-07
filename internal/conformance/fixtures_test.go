@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/vincentk1991/gavagai/internal/codegen"
 	"github.com/vincentk1991/gavagai/internal/model"
 	"github.com/vincentk1991/gavagai/internal/planner"
 	"github.com/vincentk1991/gavagai/internal/query"
@@ -67,6 +68,8 @@ func ecommerceModel(t *testing.T) *model.SemanticModel {
 				Fields: []model.Field{
 					fld("customer_id", ax("customer_id"), dim()),
 					fld("region", ax("region"), dim()),
+					// region_safe is a COALESCE dimension (null-handling rewrite).
+					fld("region_safe", ax("COALESCE(region, 'unknown')"), dim()),
 				},
 			},
 			{
@@ -87,6 +90,15 @@ func ecommerceModel(t *testing.T) *model.SemanticModel {
 					), timeDim()),
 					// status_label is a CASE WHEN dimension.
 					fld("status_label", ax("CASE WHEN status = 'complete' THEN 'done' ELSE 'pending' END"), dim()),
+					// order_quarter / order_year exercise the other DATE_TRUNC grains.
+					fld("order_quarter", dx(
+						[2]string{"ANSI_SQL", "DATE_TRUNC('quarter', created_at)"},
+						[2]string{"BIGQUERY", "DATE_TRUNC(created_at, QUARTER)"},
+					), timeDim()),
+					fld("order_year", dx(
+						[2]string{"ANSI_SQL", "DATE_TRUNC('year', created_at)"},
+						[2]string{"BIGQUERY", "DATE_TRUNC(created_at, YEAR)"},
+					), timeDim()),
 					// broken has no ANSI_SQL and no target dialect -> missing-expression error.
 					fld("broken", dx([2]string{"SNOWFLAKE", "broken"}), dim()),
 				},
@@ -97,6 +109,7 @@ func ecommerceModel(t *testing.T) *model.SemanticModel {
 					fld("order_id", ax("order_id"), nil),
 					fld("product_id", ax("product_id"), nil),
 					fld("quantity", ax("quantity"), nil),
+					fld("price", ax("price"), nil),
 				},
 			},
 			{
@@ -119,7 +132,12 @@ func ecommerceModel(t *testing.T) *model.SemanticModel {
 			{Name: "item_count", Expression: ax("COUNT(*)")},                                                         // fan-out unsafe
 			{Name: "aov", Expression: ax("AVG(amount)")},                                                             // fan-out unsafe
 			{Name: "max_amount", Expression: ax("MAX(amount)")},                                                      // fan-out safe
-			{Name: "completed_revenue", Expression: ax("SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)")}, // CASE in metric
+			{Name: "completed_revenue", Expression: ax("SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)")}, // SUM(CASE …)
+			{Name: "completed_count", Expression: ax("COUNT(CASE WHEN status = 'complete' THEN 1 END)")},             // COUNT(CASE …)
+			{Name: "avg_completed", Expression: ax("AVG(CASE WHEN status = 'complete' THEN amount END)")},            // AVG(CASE …)
+			{Name: "gross_revenue", Expression: ax("SUM(price * quantity)")},                                         // SUM(expr) on order_items grain
+			{Name: "priced_lines", Expression: ax("COUNT(price)")},                                                   // COUNT(col) excludes NULLs
+			{Name: "safe_ratio", Expression: ax("SUM(amount) / NULLIF(COUNT(*), 0)")},                                // NULLIF guards divide-by-zero
 		},
 	}
 }
@@ -194,6 +212,21 @@ func planErr(t *testing.T, q *query.Query) error {
 	t.Helper()
 	_, err := planner.Plan(q, ecommerceModel(t))
 	return err
+}
+
+// compileWith runs the full plan+pushdown+emit pipeline against an arbitrary
+// model (not the shared e-commerce fixture) and returns the SQL string.
+func compileWith(t *testing.T, m *model.SemanticModel, q *query.Query, dialect string) string {
+	t.Helper()
+	p, err := planner.Plan(q, m)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	sql, err := codegen.Compile(planner.PushDown(p), dialect)
+	if err != nil {
+		t.Fatalf("Compile(%s): %v", dialect, err)
+	}
+	return sql
 }
 
 // --- plan tree walking -----------------------------------------------------

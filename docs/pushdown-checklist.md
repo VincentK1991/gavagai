@@ -18,14 +18,18 @@ over an inline `(semantic model, query)` fixture.
   the assertion runs.
 
 Run the gates with `go test ./internal/conformance/... -v`. As of this commit:
-**49 boxes green, 30 pending** (see the progress table at the bottom). The green
-set now covers the full plan-level core (Phases 0–4) plus both SQL emitters
-(Phase 5 PostgreSQL, Phase 6 BigQuery): filter/pushdown, join resolution,
-fan-out, GROUP BY, HAVING, ORDER BY, LIMIT, SELECT DISTINCT, dialect-divergent
-identifier quoting (double-quote vs backtick), table-path, expression
-passthrough, and CASE WHEN/NULL rendering. The pending set is query-IR
-extensions (OR, semi/anti-join, OFFSET, window functions) and a few planner
-rewrites (pre-aggregation, COALESCE/NULLIF).
+**69 boxes green, 50 pending** (see the progress table at the bottom). The green
+set covers the full plan-level core (Phases 0–4) plus both SQL emitters
+(Phase 5 PostgreSQL, Phase 6 BigQuery): filter/pushdown (including OR /
+mixed AND-OR disjunctions), join resolution and ON/composite-key rendering,
+fan-out, GROUP BY, HAVING, ORDER BY (with NULLS FIRST/LAST), LIMIT/OFFSET,
+SELECT DISTINCT, COUNT variants (`*`, col, DISTINCT), conditional aggregates
+(SUM/COUNT/AVG of CASE), DATE_TRUNC grains, COALESCE/NULLIF, dialect-divergent
+expression passthrough (identifier quoting, CAST, string concat, boolean
+literals), and CASE WHEN/NULL rendering. The pending set is the larger
+features that need new plan-node types or codegen machinery: subquery/CTE
+emission, self/semi/anti-joins, pre-aggregation, window functions, ROLLUP/CUBE,
+and ambiguous-column qualification.
 
 ---
 
@@ -42,8 +46,8 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 
 ### 1.2 Multi-condition pushdown
 - [x] Push `WHERE a AND b` — both conditions pushed independently ← gate: `1.2/AND`
-- [ ] Push `WHERE a OR b` — only if the whole disjunction can be pushed (same table)
-- [ ] Mixed AND/OR: split conjuncts, push each independently where safe
+- [x] Push `WHERE a OR b` — only if the whole disjunction can be pushed (same table) ← gate: `1.2/OR`, `1.2/OR-cross-dataset-stays-above-join`
+- [x] Mixed AND/OR: split conjuncts, push each independently where safe ← gate: `1.2/mixed-and-or`
 
 ### 1.3 Pushdown through JOIN
 - [x] Push filter on left (fact) table below the JOIN (into the left scan) ← gate: `1.3/push-into-left-scan`
@@ -68,8 +72,8 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 ### 2.1 Standard inner / left join
 - [x] Single-hop LEFT JOIN between two datasets ← gate: `2.1/single-hop-left`
 - [x] Multi-hop LEFT JOIN (A → B → C) via intermediate dataset ← gate: `2.1/multi-hop`
-- [ ] Join condition rendered as `ON left.col = right.col` (codegen)
-- [x] Composite join key: multiple ON columns joined with AND ← gate: `2.1/composite-key` (plan-level; AND rendering pending)
+- [x] Join condition rendered as `ON left.col = right.col` (codegen) ← gate: `2.1/on-condition-render`
+- [x] Composite join key: multiple ON columns joined with AND ← gate: `2.1/composite-key` (plan), `2.1/composite-key-render` (AND rendering)
 
 ### 2.2 Self-join
 - [ ] Same dataset joined to itself with distinct aliases (`a AS t1`, `a AS t2`)
@@ -101,13 +105,13 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 - [x] GROUP BY on expression dimension (e.g. `DATE_TRUNC('month', created_at)`) ← gate: `3.1/expression-dimension`
 
 ### 3.2 COUNT variants
-- [ ] `COUNT(*)` rendered correctly
-- [ ] `COUNT(col)` rendered correctly (excludes NULLs)
+- [x] `COUNT(*)` rendered correctly ← gate: `3.2/count-star-render`
+- [x] `COUNT(col)` rendered correctly (excludes NULLs) ← gate: `3.2/count-col-render`
 - [x] `COUNT(DISTINCT col)` rendered correctly ← gate: `3.2/count-variants-render`
 - [x] `COUNT(DISTINCT col)` across a join (fan-out safe — does not double-count) ← gate: `3.2/count-distinct-safe-across-join`
 
 ### 3.3 Aggregate on expression
-- [ ] `SUM(price * quantity)` — expression inside aggregate rendered verbatim
+- [x] `SUM(price * quantity)` — expression inside aggregate rendered verbatim ← gate: `3.3/aggregate-on-expression`
 - [x] `AVG(CASE WHEN status = 'complete' THEN amount END)` — conditional aggregate ← gate: `3.3/conditional-aggregate-expression`
 
 ### 3.4 Pre-aggregation (push aggregation down)
@@ -137,8 +141,8 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 - [ ] LIMIT pushed into a subquery scan when no JOIN/aggregation is present
 - [x] LIMIT NOT pushed below aggregate (result set is already reduced) ← gate: `5/limit-is-outermost`
 - [x] LIMIT NOT pushed below JOIN (row count can change) ← gate: `5/limit-is-outermost`
-- [ ] OFFSET rendered alongside LIMIT when present
-- [ ] Dialect variants: `LIMIT n OFFSET m` (PostgreSQL) vs `LIMIT m, n` (MySQL) vs `FETCH FIRST n ROWS ONLY` (ANSI)
+- [x] OFFSET rendered alongside LIMIT when present ← gate: `5/offset`
+- [x] Dialect variants: `LIMIT n OFFSET m` — PostgreSQL and BigQuery (the two supported dialects) agree on this form ← gate: `5/dialect-limit-offset-form`
 
 ---
 
@@ -150,17 +154,17 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 - [ ] CASE WHEN with IS NULL / IS NOT NULL branches
 
 ### 6.2 In metric expressions
-- [ ] `SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)` — conditional sum
-- [ ] `COUNT(CASE WHEN flag = true THEN 1 END)` — conditional count
-- [ ] `AVG(CASE WHEN ...)` — conditional average
+- [x] `SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)` — conditional sum ← gate: `6.2/case-metric-render`
+- [x] `COUNT(CASE WHEN flag = true THEN 1 END)` — conditional count ← gate: `6.2/case-metric-render`
+- [x] `AVG(CASE WHEN ...)` — conditional average ← gate: `6.2/case-metric-render`
 
 ### 6.3 In filter predicates
 - [x] Filter on a CASE WHEN expression column (dimension filter, not pushed below aggregate) ← gate: `6.3/filter-on-case-dimension`
 - [ ] CASE WHEN used as a virtual boolean flag in WHERE clause
 
 ### 6.4 COALESCE / NULLIF (related null-handling rewrites)
-- [ ] `COALESCE(col, default)` in dimension expression
-- [ ] `NULLIF(col, 0)` to avoid divide-by-zero in AVG expressions
+- [x] `COALESCE(col, default)` in dimension expression ← gate: `6.4/coalesce-nullif`
+- [x] `NULLIF(col, 0)` to avoid divide-by-zero in AVG expressions ← gate: `6.4/coalesce-nullif`
 
 ---
 
@@ -168,7 +172,7 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 
 - [x] `DATE_TRUNC('day', ts)` dimension — PostgreSQL dialect ← gate: `7/date-trunc-postgres`
 - [x] `DATE_TRUNC(ts, 'day')` dimension — BigQuery dialect (argument order differs) ← gate: `7/date-trunc-bigquery`
-- [ ] `DATE_TRUNC('month', ts)` / `'quarter'` / `'year'`
+- [x] `DATE_TRUNC('month', ts)` / `'quarter'` / `'year'` ← gate: `7/date-trunc-grains`
 - [ ] `EXTRACT(DOW FROM ts)` vs `EXTRACT(DAYOFWEEK FROM ts)` dialect split
 - [ ] Date arithmetic: `ts + INTERVAL '7 days'` vs `DATE_ADD(ts, INTERVAL 7 DAY)`
 - [ ] Timezone conversion: `AT TIME ZONE` (PostgreSQL) vs `DATETIME(ts, tz)` (BigQuery)
@@ -191,7 +195,7 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 - [x] `IS NULL` / `IS NOT NULL` predicates (see §1.1) ← gate: `9/is-null-predicate`
 - [ ] LEFT JOIN null check: `WHERE right.id IS NULL` → anti-join pattern
 - [ ] `COALESCE` to replace NULL with a default in GROUP BY key (avoid null-group splitting)
-- [ ] `COUNT(col)` excludes NULLs — contrast with `COUNT(*)` in test
+- [x] `COUNT(col)` excludes NULLs — contrast with `COUNT(*)` in test ← gate: `9/count-col-excludes-null`
 - [ ] NULL-safe equality: `col IS NOT DISTINCT FROM value` (PostgreSQL) vs `col <=> value` (MySQL)
 
 ---
@@ -214,16 +218,16 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 - [x] Project/dataset prefix in BigQuery table refs: `my_project.analytics.orders` ← gate: bigquery `TestBackquoteQuoting` + golden files
 
 ### 11.2 String functions
-- [ ] `CONCAT(a, b)` vs `a || b` (PostgreSQL / ANSI)
-- [ ] `UPPER` / `LOWER` — same across dialects (no rewrite needed, verify)
+- [x] `CONCAT(a, b)` vs `a || b` (PostgreSQL / ANSI) ← gate: `11/casts-and-string-fns`
+- [x] `UPPER` / `LOWER` — same across dialects (no rewrite needed, verify) ← gate: `11/casts-and-string-fns`
 
 ### 11.3 Boolean literals
-- [ ] PostgreSQL: `TRUE` / `FALSE`
-- [ ] BigQuery: `TRUE` / `FALSE` (same — no rewrite, verify test)
+- [x] PostgreSQL: `TRUE` / `FALSE` ← gate: `11/casts-and-string-fns`
+- [x] BigQuery: `TRUE` / `FALSE` (same — no rewrite, verify test) ← gate: `11/casts-and-string-fns`
 
 ### 11.4 Type casts
-- [ ] `CAST(col AS INT64)` BigQuery vs `CAST(col AS INTEGER)` PostgreSQL
-- [ ] `col::integer` PostgreSQL shorthand — not valid in BigQuery
+- [x] `CAST(col AS INT64)` BigQuery vs `CAST(col AS INTEGER)` PostgreSQL ← gate: `11/casts-and-string-fns`
+- [x] `col::integer` PostgreSQL shorthand — not valid in BigQuery ← gate: `11/casts-and-string-fns`
 
 ### 11.5 LIMIT syntax (see §5)
 
@@ -248,7 +252,7 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 - [x] `ORDER BY col ASC` / `ORDER BY col DESC` ← gate: `13/directions-and-default`
 - [x] `ORDER BY` on a metric alias (post-aggregate reference) ← gate: `13/directions-and-default`
 - [x] `ORDER BY` on a dimension expression (must match GROUP BY expression exactly) ← gate: `13/directions-and-default` (alias form)
-- [ ] `NULLS FIRST` / `NULLS LAST` (PostgreSQL) vs `IS NULL ASC` trick (BigQuery workaround)
+- [x] `NULLS FIRST` / `NULLS LAST` — supported natively by both PostgreSQL and BigQuery ← gate: `13/nulls-first-last`
 - [x] Multiple ORDER BY columns with mixed directions ← gate: `13/directions-and-default`
 
 ---
@@ -267,18 +271,18 @@ rewrites (pre-aggregation, COALESCE/NULLIF).
 
 | Section | Total items | Done |
 |---------|-------------|------|
-| 1. Filter pushdown | 16 | 15 |
-| 2. JOIN rewriting | 15 | 3 |
-| 3. Aggregation rewriting | 12 | 6 |
+| 1. Filter pushdown | 20 | 17 |
+| 2. JOIN rewriting | 16 | 5 |
+| 3. Aggregation rewriting | 14 | 9 |
 | 4. DISTINCT | 5 | 1 |
-| 5. LIMIT / OFFSET | 7 | 3 |
-| 6. CASE WHEN | 11 | 2 |
-| 7. Date/time grain | 7 | 2 |
-| 8. Subquery / CTE | 7 | 0 |
-| 9. NULL handling | 5 | 1 |
+| 5. LIMIT / OFFSET | 6 | 5 |
+| 6. CASE WHEN | 10 | 7 |
+| 7. Date/time grain | 6 | 3 |
+| 8. Subquery / CTE | 6 | 0 |
+| 9. NULL handling | 5 | 2 |
 | 10. Window functions | 5 | 0 |
-| 11. Dialect rewrites | 12 | 4 |
+| 11. Dialect rewrites | 11 | 9 |
 | 12. Expression passthrough | 5 | 4 |
-| 13. ORDER BY | 5 | 3 |
+| 13. ORDER BY | 5 | 5 |
 | 14. Safety rules | 5 | 2 |
-| **Total** | **117** | **49** |
+| **Total** | **119** | **69** |

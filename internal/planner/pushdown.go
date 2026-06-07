@@ -50,7 +50,7 @@ func pushDown(n PlanNode) PlanNode {
 		return &OrderNode{Input: pushDown(t.Input), Items: t.Items}
 
 	case *LimitNode:
-		return &LimitNode{Input: pushDown(t.Input), Count: t.Count}
+		return &LimitNode{Input: pushDown(t.Input), Count: t.Count, HasLimit: t.HasLimit, Offset: t.Offset}
 
 	default:
 		return n
