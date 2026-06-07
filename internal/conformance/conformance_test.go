@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/vincentk1991/gavagai/internal/codegen"
+	_ "github.com/vincentk1991/gavagai/internal/codegen/bigquery" // registers bigquery dialect
 	_ "github.com/vincentk1991/gavagai/internal/codegen/postgres" // registers postgres dialect
 	"github.com/vincentk1991/gavagai/internal/planner"
 	"github.com/vincentk1991/gavagai/internal/query"
@@ -573,10 +574,21 @@ func TestWindowFunctions(t *testing.T) {
 // conformance gates.
 func compilePostgres(t *testing.T, q *query.Query) string {
 	t.Helper()
+	return compileDialect(t, q, "postgres")
+}
+
+// compileBigQuery is the BigQuery counterpart of compilePostgres.
+func compileBigQuery(t *testing.T, q *query.Query) string {
+	t.Helper()
+	return compileDialect(t, q, "bigquery")
+}
+
+func compileDialect(t *testing.T, q *query.Query, dialect string) string {
+	t.Helper()
 	plan := mustPlan(t, q) // already calls PushDown
-	sql, err := codegen.Compile(plan, "postgres")
+	sql, err := codegen.Compile(plan, dialect)
 	if err != nil {
-		t.Fatalf("Compile(postgres): %v", err)
+		t.Fatalf("Compile(%s): %v", dialect, err)
 	}
 	return sql
 }
@@ -629,6 +641,39 @@ func TestDialectRewrites(t *testing.T) {
 		sql := compilePostgres(t, q)
 		if !strings.Contains(sql, "FROM analytics.orders") {
 			t.Errorf("FROM clause should use analytics.orders table path:\n%s", sql)
+		}
+	})
+
+	// §11.1 — BigQuery identifier quoting: join ON conditions use
+	// backtick-quoted `dataset`.`column` syntax.
+	t.Run("11/bigquery-backtick-quoting", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region"},
+		}
+		sql := compileBigQuery(t, q)
+		want := "`orders`.`customer_id` = `customers`.`customer_id`"
+		if !strings.Contains(sql, want) {
+			t.Errorf("join ON condition should use backtick identifiers\nwant substring: %s\ngot:\n%s", want, sql)
+		}
+		if strings.Contains(sql, `"orders"`) {
+			t.Errorf("BigQuery output must not contain double-quoted identifiers:\n%s", sql)
+		}
+	})
+
+	// §11 — the same plan compiled for both dialects diverges in quoting.
+	t.Run("11/dialect-divergence", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.order_count"}, Dimensions: []string{"customers.region"}}
+		pg := compilePostgres(t, q)
+		bq := compileBigQuery(t, q)
+		if pg == bq {
+			t.Errorf("postgres and bigquery output should differ:\n%s", pg)
+		}
+		if !strings.Contains(bq, "`") {
+			t.Errorf("bigquery output should contain backticks:\n%s", bq)
+		}
+		if !strings.Contains(pg, `"`) {
+			t.Errorf("postgres output should contain double quotes:\n%s", pg)
 		}
 	})
 

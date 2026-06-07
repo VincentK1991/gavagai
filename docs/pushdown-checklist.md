@@ -18,13 +18,14 @@ over an inline `(semantic model, query)` fixture.
   the assertion runs.
 
 Run the gates with `go test ./internal/conformance/... -v`. As of this commit:
-**47 boxes green, 30 pending** (see the progress table at the bottom). The green
-set now covers the full plan-level core (Phases 0–4) plus the Phase 5 PostgreSQL
-emitter: filter/pushdown, join resolution, fan-out, GROUP BY, HAVING, ORDER BY,
-LIMIT, SELECT DISTINCT, identifier quoting, table-path, expression passthrough,
-and CASE WHEN/NULL rendering. The pending set is BigQuery codegen (Phase 6),
-query-IR extensions (OR, semi/anti-join, OFFSET, window functions), and a few
-planner rewrites (pre-aggregation, COALESCE/NULLIF).
+**49 boxes green, 30 pending** (see the progress table at the bottom). The green
+set now covers the full plan-level core (Phases 0–4) plus both SQL emitters
+(Phase 5 PostgreSQL, Phase 6 BigQuery): filter/pushdown, join resolution,
+fan-out, GROUP BY, HAVING, ORDER BY, LIMIT, SELECT DISTINCT, dialect-divergent
+identifier quoting (double-quote vs backtick), table-path, expression
+passthrough, and CASE WHEN/NULL rendering. The pending set is query-IR
+extensions (OR, semi/anti-join, OFFSET, window functions) and a few planner
+rewrites (pre-aggregation, COALESCE/NULLIF).
 
 ---
 
@@ -209,8 +210,8 @@ planner rewrites (pre-aggregation, COALESCE/NULLIF).
 
 ### 11.1 Identifier quoting
 - [x] PostgreSQL: double-quote identifiers (`"orders"."customer_id"`) ← gate: `11/identifier-quoting`
-- [ ] BigQuery: backtick identifiers (`` `project.dataset.table` ``) (Phase 6)
-- [ ] Project/dataset prefix in BigQuery table refs: `my_project.analytics.orders` (Phase 6)
+- [x] BigQuery: backtick identifiers (`` `orders`.`customer_id` ``) ← gate: `11/bigquery-backtick-quoting`, `11/dialect-divergence`
+- [x] Project/dataset prefix in BigQuery table refs: `my_project.analytics.orders` ← gate: bigquery `TestBackquoteQuoting` + golden files
 
 ### 11.2 String functions
 - [ ] `CONCAT(a, b)` vs `a || b` (PostgreSQL / ANSI)
@@ -276,8 +277,8 @@ planner rewrites (pre-aggregation, COALESCE/NULLIF).
 | 8. Subquery / CTE | 7 | 0 |
 | 9. NULL handling | 5 | 1 |
 | 10. Window functions | 5 | 0 |
-| 11. Dialect rewrites | 12 | 2 |
+| 11. Dialect rewrites | 12 | 4 |
 | 12. Expression passthrough | 5 | 4 |
 | 13. ORDER BY | 5 | 3 |
 | 14. Safety rules | 5 | 2 |
-| **Total** | **117** | **47** |
+| **Total** | **117** | **49** |

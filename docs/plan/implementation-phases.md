@@ -333,8 +333,15 @@ Fixtures to cover:
 
 | File / dir | Purpose |
 |---|---|
-| `internal/codegen/bigquery/emitter.go` | `BigQueryDialect` implementing `Dialect` |
-| `internal/codegen/bigquery/expr.go` | BigQuery-specific rendering: backtick identifier quoting (`` `project.dataset.table` ``), `DATE_TRUNC(col, MONTH)` argument order, `LIMIT` syntax |
+| `internal/codegen/bigquery/emitter.go` | `BigQueryDialect` + `renderer` implementing `codegen.Renderer` |
+
+> **Implementation note (deviation from the original sketch):** the SQL clause
+> structure proved identical across PostgreSQL and BigQuery, so the builder was
+> extracted into `internal/codegen/sqlbuilder.go` (`EmitSelect` + the `Renderer`
+> interface) rather than duplicated per dialect. Each dialect package now
+> supplies only its `Renderer` (quoting + dialect tag); there is no per-dialect
+> `expr.go`. Argument-order differences such as `DATE_TRUNC(col, MONTH)` are
+> carried in the semantic model's per-dialect expression entries, not in code.
 | `testdata/golden/bigquery/` | Golden `.sql` files matching the same fixtures as Phase 5 |
 
 ### BigQuery differences from Postgres to cover
