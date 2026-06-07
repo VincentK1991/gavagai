@@ -101,33 +101,41 @@ gavagai [command] [flags]
 gavagai compile \
   --model   model.yaml \
   --query   query.json \
-  --dialect bigquery
+  --dialect postgres
 ```
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--model` | `-m` | — | Path to semantic model file (YAML or JSON) |
-| `--query` | `-q` | — | Path to query file (JSON) |
-| `--dialect` | `-d` | `bigquery` | Target SQL dialect (`bigquery`, `snowflake`, `postgres`, `duckdb`) |
-| `--pretty` | | false | Pretty-print the output SQL |
-| `--explain` | | false | Print the query plan alongside SQL |
+| `--model` | `-m` | — (required) | Path to semantic model file (YAML or JSON) |
+| `--query` | `-q` | — (required) | Path to query file (JSON) |
+| `--dialect` | `-d` | — (required) | Target SQL dialect (`postgres` or `bigquery`) |
+| `--pretty` | | false | Emit multi-line SQL (default: compact single line) |
+| `--explain` | | false | Print the query plan to **stderr** before the SQL |
 
-**Output** (stdout):
+SQL is written to **stdout**; the `--explain` plan and all errors go to **stderr**,
+so `gavagai compile ... > out.sql` always yields clean SQL.
+
+**Output** (`--pretty`, stdout):
 
 ```sql
 SELECT
-  customers.id,
-  SUM(orders.amount) AS revenue
-FROM (
-  SELECT customer_id, amount
-  FROM raw.orders
-  WHERE status = 'complete'   -- pushed down
-) AS orders
-LEFT JOIN raw.customers AS customers
-  ON orders.customer_id = customers.id
-GROUP BY customers.id
-LIMIT 100
+  region AS "region",
+  tier AS "tier",
+  SUM(orders.amount) AS "revenue",
+  COUNT(DISTINCT orders.order_id) AS "order_count"
+FROM analytics.orders AS "orders"
+LEFT JOIN analytics.customers AS "customers"
+  ON "orders"."customer_id" = "customers"."customer_id"
+WHERE status = 'complete'
+  AND tier IN ('gold', 'silver')
+GROUP BY region, tier
+HAVING SUM(orders.amount) >= 500
+ORDER BY "revenue" DESC
+LIMIT 20
 ```
+
+The same query for `--dialect bigquery` differs only in quoting
+(`` `region` ``) and table path (`` `my_project.analytics.orders` ``).
 
 ### `validate`
 

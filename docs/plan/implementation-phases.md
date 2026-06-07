@@ -376,8 +376,18 @@ Additional test: compile same `(model, query)` for both dialects in one test and
 |---|---|
 | `cmd/compile.go` | Implements `--model`, `--query`, `--dialect`, `--pretty`, `--explain` flags; runs full pipeline; writes SQL to stdout |
 | `cmd/validate.go` | Implements `--model` flag; runs model parse + validate; exits 0 or 1 |
-| `internal/pretty/pretty.go` | Optional SQL pretty-printer (indent, newlines) for `--pretty` |
-| `testdata/e2e/` | End-to-end fixture pairs `(model.yaml, query.json)` with expected `.sql` outputs |
+| `internal/pipeline/pipeline.go` | Orchestrates parse→validate→plan→pushdown→emit; registers both dialects; keeps `cmd` thin and unit-testable |
+| `internal/pretty/pretty.go` | `Compact` collapses emitted SQL to one line (CLI default); `--pretty` keeps the multi-line form |
+
+> **Implementation notes (deviations):**
+> - A dedicated `internal/pipeline` package was added so the orchestration is
+>   testable without a Cobra tree and owns the dialect blank-imports.
+> - `--pretty` controls compact-vs-multiline rather than adding indentation:
+>   the emitters already produce canonical multi-line SQL, so the CLI default
+>   compacts it to one line (machine-friendly) and `--pretty` keeps it expanded.
+> - No `testdata/e2e/` dir: the existing model/query fixtures and emitter golden
+>   files are the single source of truth, exercised through the CLI by the
+>   `cmd` integration tests (reusing them avoids fixture drift).
 
 ### CLI interface (final)
 
