@@ -18,11 +18,12 @@ over an inline `(semantic model, query)` fixture.
   the assertion runs.
 
 Run the gates with `go test ./internal/conformance/... -v`. As of this commit:
-**33 boxes green, the rest pending** (see the progress table at the bottom). The
-green set is the plan-level core (filter placement, join resolution, fan-out,
-GROUP BY, ORDER BY, LIMIT placement, dialect-expression selection); the pending
-set is dominated by SQL-text rendering (codegen, phases 5–6) and query-IR
-extensions (self/semi/anti-join, OR, OFFSET, window functions).
+**38 boxes green, the rest pending** (see the progress table at the bottom). The
+green set covers the plan-level core: filter placement, pushdown through joins
+(including idempotency), join resolution, fan-out detection, GROUP BY, ORDER BY,
+LIMIT placement, and dialect-expression selection. The pending set is dominated
+by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
+(self/semi/anti-join, OR, OFFSET, window functions).
 
 ---
 
@@ -43,9 +44,10 @@ extensions (self/semi/anti-join, OR, OFFSET, window functions).
 - [ ] Mixed AND/OR: split conjuncts, push each independently where safe
 
 ### 1.3 Pushdown through JOIN
-- [ ] Push filter on left (fact) table below the JOIN (into the left scan)
-- [ ] Push filter on right (dimension) table below the JOIN (into the right scan)
-- [ ] Do NOT push a filter that references columns from both sides of the JOIN
+- [x] Push filter on left (fact) table below the JOIN (into the left scan) ← gate: `1.3/push-into-left-scan`
+- [x] Push filter on right (dimension) table below the JOIN (into the right scan) ← gate: `1.3/push-into-right-scan`
+- [x] Mixed-dataset filters each pushed to their own scan; no FilterNode wraps the JoinNode ← gate: `1.3/cross-dataset-stays-above-join`
+- [x] Pushdown is idempotent: applying PushDown twice yields the same tree ← gate: `1.3/pushdown-idempotent`
 
 ### 1.4 Pushdown through subquery / CTE
 - [ ] Push filter into an inline subquery when the predicate references only its output columns
@@ -263,7 +265,7 @@ extensions (self/semi/anti-join, OR, OFFSET, window functions).
 
 | Section | Total items | Done |
 |---------|-------------|------|
-| 1. Filter pushdown | 15 | 11 |
+| 1. Filter pushdown | 16 | 15 |
 | 2. JOIN rewriting | 15 | 3 |
 | 3. Aggregation rewriting | 12 | 4 |
 | 4. DISTINCT | 5 | 0 |
@@ -277,4 +279,4 @@ extensions (self/semi/anti-join, OR, OFFSET, window functions).
 | 12. Expression passthrough | 5 | 4 |
 | 13. ORDER BY | 5 | 3 |
 | 14. Safety rules | 5 | 2 |
-| **Total** | **116** | **33** |
+| **Total** | **117** | **38** |

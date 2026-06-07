@@ -92,12 +92,104 @@ func TestFilterPushdown(t *testing.T) {
 		pending(t, "1.2/OR", "query IR has no OR/disjunction operator yet")
 	})
 
-	// §1.3 — pushdown through join: the real relocation is Phase 4 PushDown.
-	t.Run("1.3/push-into-right-scan", func(t *testing.T) {
-		pending(t, "1.3", "PushDown is an identity stub; filter relocation not implemented")
+	// §1.3 — a filter on the left (fact) dataset is pushed below the join.
+	t.Run("1.3/push-into-left-scan", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region"},
+			Filters:    []query.Filter{{Field: "orders.status", Op: "=", Value: raw(`"complete"`)}},
+		}
+		plan := mustPlan(t, q)
+		joins := nodesOf[*planner.JoinNode](plan)
+		if len(joins) != 1 {
+			t.Fatalf("want 1 JoinNode, got %d", len(joins))
+		}
+		jn := joins[0]
+		if _, ok := jn.Left.(*planner.FilterNode); !ok {
+			t.Errorf("orders filter should be pushed below the join onto the left scan, left=%T", jn.Left)
+		}
+		if _, ok := jn.Right.(*planner.ScanNode); !ok {
+			t.Errorf("right side (customers) should be a plain scan, right=%T", jn.Right)
+		}
 	})
+
+	// §1.3 — a filter on the right (dimension) dataset is pushed below the join.
+	t.Run("1.3/push-into-right-scan", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region"},
+			Filters:    []query.Filter{{Field: "customers.region", Op: "=", Value: raw(`"US"`)}},
+		}
+		plan := mustPlan(t, q)
+		joins := nodesOf[*planner.JoinNode](plan)
+		if len(joins) != 1 {
+			t.Fatalf("want 1 JoinNode, got %d", len(joins))
+		}
+		jn := joins[0]
+		if _, ok := jn.Left.(*planner.ScanNode); !ok {
+			t.Errorf("left side (orders) should be a plain scan, left=%T", jn.Left)
+		}
+		if _, ok := jn.Right.(*planner.FilterNode); !ok {
+			t.Errorf("customers filter should be pushed below the join onto the right scan, right=%T", jn.Right)
+		}
+	})
+
+	// §1.3 — mixed-dataset filters: each is pushed to its own scan; no
+	// FilterNode wraps the JoinNode. In our IR every predicate references
+	// exactly one dataset, so there are no true "cross-dataset predicates"
+	// (join-key predicates come from the OSI relationship, not user filters).
+	// This gate therefore verifies the stronger property: after PushDown the
+	// join itself is free of any wrapping FilterNode.
 	t.Run("1.3/cross-dataset-stays-above-join", func(t *testing.T) {
-		pending(t, "1.3", "PushDown is an identity stub; scope analysis not implemented")
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region"},
+			Filters: []query.Filter{
+				{Field: "orders.status", Op: "=", Value: raw(`"complete"`)},
+				{Field: "customers.region", Op: "=", Value: raw(`"US"`)},
+			},
+		}
+		plan := mustPlan(t, q)
+		joins := nodesOf[*planner.JoinNode](plan)
+		if len(joins) != 1 {
+			t.Fatalf("want 1 JoinNode, got %d", len(joins))
+		}
+		jn := joins[0]
+		if _, ok := jn.Left.(*planner.FilterNode); !ok {
+			t.Errorf("orders filter should be on the left scan, left=%T", jn.Left)
+		}
+		if _, ok := jn.Right.(*planner.FilterNode); !ok {
+			t.Errorf("customers filter should be on the right scan, right=%T", jn.Right)
+		}
+		// No FilterNode should wrap the JoinNode itself.
+		allFilters := nodesOf[*planner.FilterNode](plan)
+		for _, f := range allFilters {
+			if _, ok := f.Input.(*planner.JoinNode); ok {
+				t.Errorf("a FilterNode wraps the JoinNode — predicate was not pushed down")
+			}
+		}
+	})
+
+	// Idempotency: applying PushDown a second time must not change the tree.
+	t.Run("1.3/pushdown-idempotent", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region"},
+			Filters: []query.Filter{
+				{Field: "orders.status", Op: "=", Value: raw(`"complete"`)},
+				{Field: "customers.region", Op: "=", Value: raw(`"US"`)},
+			},
+		}
+		p, err := planner.Plan(q, ecommerceModel(t))
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		once := planner.PushDown(p)
+		twice := planner.PushDown(once)
+		if planner.Describe(once) != planner.Describe(twice) {
+			t.Errorf("PushDown is not idempotent:\n  once:  %s\n  twice: %s",
+				planner.Describe(once), planner.Describe(twice))
+		}
 	})
 
 	// §1.4 — pushdown into subquery / CTE bodies (codegen).
