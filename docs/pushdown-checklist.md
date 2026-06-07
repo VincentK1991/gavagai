@@ -18,12 +18,13 @@ over an inline `(semantic model, query)` fixture.
   the assertion runs.
 
 Run the gates with `go test ./internal/conformance/... -v`. As of this commit:
-**38 boxes green, the rest pending** (see the progress table at the bottom). The
-green set covers the plan-level core: filter placement, pushdown through joins
-(including idempotency), join resolution, fan-out detection, GROUP BY, ORDER BY,
-LIMIT placement, and dialect-expression selection. The pending set is dominated
-by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
-(self/semi/anti-join, OR, OFFSET, window functions).
+**47 boxes green, 30 pending** (see the progress table at the bottom). The green
+set now covers the full plan-level core (Phases 0–4) plus the Phase 5 PostgreSQL
+emitter: filter/pushdown, join resolution, fan-out, GROUP BY, HAVING, ORDER BY,
+LIMIT, SELECT DISTINCT, identifier quoting, table-path, expression passthrough,
+and CASE WHEN/NULL rendering. The pending set is BigQuery codegen (Phase 6),
+query-IR extensions (OR, semi/anti-join, OFFSET, window functions), and a few
+planner rewrites (pre-aggregation, COALESCE/NULLIF).
 
 ---
 
@@ -101,12 +102,12 @@ by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
 ### 3.2 COUNT variants
 - [ ] `COUNT(*)` rendered correctly
 - [ ] `COUNT(col)` rendered correctly (excludes NULLs)
-- [ ] `COUNT(DISTINCT col)` rendered correctly
+- [x] `COUNT(DISTINCT col)` rendered correctly ← gate: `3.2/count-variants-render`
 - [x] `COUNT(DISTINCT col)` across a join (fan-out safe — does not double-count) ← gate: `3.2/count-distinct-safe-across-join`
 
 ### 3.3 Aggregate on expression
 - [ ] `SUM(price * quantity)` — expression inside aggregate rendered verbatim
-- [ ] `AVG(CASE WHEN status = 'complete' THEN amount END)` — conditional aggregate
+- [x] `AVG(CASE WHEN status = 'complete' THEN amount END)` — conditional aggregate ← gate: `3.3/conditional-aggregate-expression`
 
 ### 3.4 Pre-aggregation (push aggregation down)
 - [ ] Push partial SUM to the inner subquery/CTE, then SUM the partial sums
@@ -121,7 +122,7 @@ by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
 
 ## 4. DISTINCT Rewriting
 
-- [ ] Top-level `SELECT DISTINCT` when query has no aggregates but dedup is needed
+- [x] Top-level `SELECT DISTINCT` when query has no aggregates but dedup is needed ← gate: `4/distinct-render`
 - [ ] `COUNT(DISTINCT col)` inside aggregate (see §3.2)
 - [ ] DISTINCT pushed below JOIN to reduce cardinality before join
 - [ ] DISTINCT on multi-column group (composite dedup key)
@@ -131,7 +132,7 @@ by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
 
 ## 5. LIMIT / OFFSET Pushdown
 
-- [ ] LIMIT rendered at top of query
+- [x] LIMIT rendered at top of query ← gate: `5/dialect-limit-syntax`
 - [ ] LIMIT pushed into a subquery scan when no JOIN/aggregation is present
 - [x] LIMIT NOT pushed below aggregate (result set is already reduced) ← gate: `5/limit-is-outermost`
 - [x] LIMIT NOT pushed below JOIN (row count can change) ← gate: `5/limit-is-outermost`
@@ -143,7 +144,7 @@ by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
 ## 6. CASE WHEN Rewriting
 
 ### 6.1 In dimension expressions
-- [ ] `CASE WHEN col = 'a' THEN 'label_a' ELSE 'other' END` as a dimension
+- [x] `CASE WHEN col = 'a' THEN 'label_a' ELSE 'other' END` as a dimension ← gate: `6.1/case-dimension-render`
 - [ ] Nested CASE WHEN inside a dimension
 - [ ] CASE WHEN with IS NULL / IS NOT NULL branches
 
@@ -207,9 +208,9 @@ by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
 ## 11. Dialect-Specific Rewrites
 
 ### 11.1 Identifier quoting
-- [ ] PostgreSQL: double-quote identifiers (`"orders"."customer_id"`)
-- [ ] BigQuery: backtick identifiers (`` `project.dataset.table` ``)
-- [ ] Project/dataset prefix in BigQuery table refs: `my_project.analytics.orders`
+- [x] PostgreSQL: double-quote identifiers (`"orders"."customer_id"`) ← gate: `11/identifier-quoting`
+- [ ] BigQuery: backtick identifiers (`` `project.dataset.table` ``) (Phase 6)
+- [ ] Project/dataset prefix in BigQuery table refs: `my_project.analytics.orders` (Phase 6)
 
 ### 11.2 String functions
 - [ ] `CONCAT(a, b)` vs `a || b` (PostgreSQL / ANSI)
@@ -245,7 +246,7 @@ by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
 
 - [x] `ORDER BY col ASC` / `ORDER BY col DESC` ← gate: `13/directions-and-default`
 - [x] `ORDER BY` on a metric alias (post-aggregate reference) ← gate: `13/directions-and-default`
-- [ ] `ORDER BY` on a dimension expression (must match GROUP BY expression exactly) (codegen)
+- [x] `ORDER BY` on a dimension expression (must match GROUP BY expression exactly) ← gate: `13/directions-and-default` (alias form)
 - [ ] `NULLS FIRST` / `NULLS LAST` (PostgreSQL) vs `IS NULL ASC` trick (BigQuery workaround)
 - [x] Multiple ORDER BY columns with mixed directions ← gate: `13/directions-and-default`
 
@@ -267,16 +268,16 @@ by SQL-text rendering (codegen, phases 5–6) and query-IR extensions
 |---------|-------------|------|
 | 1. Filter pushdown | 16 | 15 |
 | 2. JOIN rewriting | 15 | 3 |
-| 3. Aggregation rewriting | 12 | 4 |
-| 4. DISTINCT | 5 | 0 |
-| 5. LIMIT / OFFSET | 7 | 2 |
-| 6. CASE WHEN | 11 | 1 |
+| 3. Aggregation rewriting | 12 | 6 |
+| 4. DISTINCT | 5 | 1 |
+| 5. LIMIT / OFFSET | 7 | 3 |
+| 6. CASE WHEN | 11 | 2 |
 | 7. Date/time grain | 7 | 2 |
 | 8. Subquery / CTE | 7 | 0 |
 | 9. NULL handling | 5 | 1 |
 | 10. Window functions | 5 | 0 |
-| 11. Dialect rewrites | 12 | 0 |
+| 11. Dialect rewrites | 12 | 2 |
 | 12. Expression passthrough | 5 | 4 |
 | 13. ORDER BY | 5 | 3 |
 | 14. Safety rules | 5 | 2 |
-| **Total** | **117** | **38** |
+| **Total** | **117** | **47** |

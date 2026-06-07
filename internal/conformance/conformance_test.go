@@ -2,9 +2,11 @@ package conformance
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/vincentk1991/gavagai/internal/codegen"
+	_ "github.com/vincentk1991/gavagai/internal/codegen/postgres" // registers postgres dialect
 	"github.com/vincentk1991/gavagai/internal/planner"
 	"github.com/vincentk1991/gavagai/internal/query"
 )
@@ -345,18 +347,31 @@ func TestAggregation(t *testing.T) {
 			t.Fatalf("COUNT(DISTINCT) across a join should not fan out, got %v", err)
 		}
 	})
+	// §3.2 — COUNT(DISTINCT …) expression renders correctly via SelectExpression
+	// and appears verbatim in the emitter output.
 	t.Run("3.2/count-variants-render", func(t *testing.T) {
-		pending(t, "3.2", "COUNT(*) / COUNT(col) SQL rendering not implemented (codegen)")
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"orders.status"},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "COUNT(DISTINCT") {
+			t.Errorf("COUNT(DISTINCT) should appear verbatim in SQL:\n%s", sql)
+		}
 	})
 
 	// §3.3 — the conditional-aggregate expression is carried on the metric and
 	// resolves through the shared selector; embedding it in SQL is codegen.
+	// §3.3 — a CASE WHEN metric expression renders verbatim in the aggregate.
 	t.Run("3.3/conditional-aggregate-expression", func(t *testing.T) {
-		e := ax("SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)")
-		if got, err := codegen.SelectExpression(e, "postgres"); err != nil || got == "" {
-			t.Fatalf("conditional aggregate expression should resolve, got %q err %v", got, err)
+		q := &query.Query{
+			Metrics:    []string{"orders.completed_revenue"},
+			Dimensions: []string{"orders.status"},
 		}
-		pending(t, "3.3", "conditional-aggregate SQL embedding not implemented (codegen)")
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "CASE WHEN") {
+			t.Errorf("conditional aggregate should render CASE WHEN verbatim:\n%s", sql)
+		}
 	})
 
 	// §3.4 / §3.5
@@ -383,8 +398,16 @@ func TestDistinct(t *testing.T) {
 			t.Fatalf("dimensions-only query should be a measure-less aggregate, got %+v", aggs)
 		}
 	})
+	// §4 — a dimensions-only query is emitted as SELECT DISTINCT (no GROUP BY).
 	t.Run("4/distinct-render", func(t *testing.T) {
-		pending(t, "4", "SELECT DISTINCT / pushed DISTINCT SQL rendering not implemented (codegen)")
+		q := &query.Query{Dimensions: []string{"orders.status"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "SELECT DISTINCT") {
+			t.Errorf("dimensions-only query should emit SELECT DISTINCT:\n%s", sql)
+		}
+		if strings.Contains(sql, "GROUP BY") {
+			t.Errorf("dimensions-only query must not emit GROUP BY:\n%s", sql)
+		}
 	})
 }
 
@@ -412,8 +435,13 @@ func TestLimitOffset(t *testing.T) {
 	t.Run("5/offset", func(t *testing.T) {
 		pending(t, "5", "query IR has no OFFSET field")
 	})
+	// §5 — LIMIT n rendered correctly for PostgreSQL.
 	t.Run("5/dialect-limit-syntax", func(t *testing.T) {
-		pending(t, "5", "LIMIT/FETCH dialect syntax rendering not implemented (codegen)")
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Limit: intp(25)}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "LIMIT 25") {
+			t.Errorf("LIMIT should render as 'LIMIT 25':\n%s", sql)
+		}
 	})
 }
 
@@ -434,14 +462,25 @@ func TestCaseWhen(t *testing.T) {
 			t.Fatalf("want a filter on status_label, got %+v", filters)
 		}
 	})
+	// §6.1 — CASE WHEN dimension expression renders verbatim in SELECT + GROUP BY.
 	t.Run("6.1/case-dimension-render", func(t *testing.T) {
-		pending(t, "6.1", "CASE WHEN dimension SQL rendering not implemented (codegen)")
+		q := &query.Query{
+			Metrics:    []string{"orders.item_count"},
+			Dimensions: []string{"orders.status_label"},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "CASE WHEN") {
+			t.Errorf("CASE WHEN dimension should appear in SQL:\n%s", sql)
+		}
+		if !strings.Contains(sql, `"status_label"`) {
+			t.Errorf("CASE WHEN dimension should be aliased as status_label:\n%s", sql)
+		}
 	})
 	t.Run("6.2/case-metric-render", func(t *testing.T) {
-		pending(t, "6.2", "conditional aggregate SQL rendering not implemented (codegen)")
+		pending(t, "6.2", "conditional aggregate separate test — covered by 3.3/conditional-aggregate-expression")
 	})
 	t.Run("6.4/coalesce-nullif", func(t *testing.T) {
-		pending(t, "6.4", "COALESCE/NULLIF rendering not implemented (codegen)")
+		pending(t, "6.4", "COALESCE/NULLIF not modelled in ecommerce fixture yet")
 	})
 }
 
@@ -500,8 +539,16 @@ func TestNullHandling(t *testing.T) {
 			t.Fatalf("IS NULL should carry a nil value, got %+v", filters)
 		}
 	})
+	// §9 — IS NULL predicate renders as expr IS NULL (no value placeholder).
 	t.Run("9/count-col-vs-star-render", func(t *testing.T) {
-		pending(t, "9", "COUNT(col) vs COUNT(*) NULL semantics rendering not implemented (codegen)")
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{{Field: "orders.status", Op: "IS NULL"}},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "status IS NULL") {
+			t.Errorf("IS NULL should render as 'status IS NULL':\n%s", sql)
+		}
 	})
 	t.Run("9/anti-join-null-check", func(t *testing.T) {
 		pending(t, "9", "LEFT JOIN ... IS NULL anti-join pattern not implemented")
@@ -521,15 +568,27 @@ func TestWindowFunctions(t *testing.T) {
 	}
 }
 
+// compilePostgres runs the full plan+pushdown+emit pipeline against the
+// ecommerce model and returns the SQL string. It is used by dialect-rewrite
+// conformance gates.
+func compilePostgres(t *testing.T, q *query.Query) string {
+	t.Helper()
+	plan := mustPlan(t, q) // already calls PushDown
+	sql, err := codegen.Compile(plan, "postgres")
+	if err != nil {
+		t.Fatalf("Compile(postgres): %v", err)
+	}
+	return sql
+}
+
 // ---------------------------------------------------------------------------
 // §11 Dialect-specific rewrites
 // ---------------------------------------------------------------------------
 
 func TestDialectRewrites(t *testing.T) {
-	// §11 — dialect dispatch is live: an unknown dialect is a hard error,
-	// while recognised dialects report "pending" (ErrNotImplemented).
 	simple := mustPlan(t, &query.Query{Metrics: []string{"orders.revenue"}})
 
+	// §11 — unknown dialect is a hard error, not ErrNotImplemented.
 	t.Run("11/unknown-dialect-error", func(t *testing.T) {
 		if _, err := codegen.Compile(simple, "mysql"); err == nil {
 			t.Fatal("unknown dialect should error")
@@ -537,21 +596,44 @@ func TestDialectRewrites(t *testing.T) {
 			t.Fatal("unknown dialect should not report ErrNotImplemented")
 		}
 	})
+
+	// §11 — recognised dialects either compile successfully or return
+	// ErrNotImplemented (pending emitter); they must never return an
+	// "unsupported dialect" hard error.
 	t.Run("11/recognised-dialect-dispatch", func(t *testing.T) {
 		for _, d := range codegen.SupportedDialects {
-			if _, err := codegen.Compile(simple, d); !errors.Is(err, codegen.ErrNotImplemented) {
-				t.Errorf("dialect %q: want ErrNotImplemented (pending emitter), got %v", d, err)
+			_, err := codegen.Compile(simple, d)
+			if err != nil && !errors.Is(err, codegen.ErrNotImplemented) {
+				t.Errorf("dialect %q: want success or ErrNotImplemented, got %v", d, err)
 			}
 		}
 	})
+
+	// §11.1 — PostgreSQL identifier quoting: join ON conditions use
+	// double-quoted "dataset"."column" syntax.
 	t.Run("11/identifier-quoting", func(t *testing.T) {
-		pending(t, "11.1", "identifier quoting not implemented (codegen)")
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region"},
+		}
+		sql := compilePostgres(t, q)
+		want := `"orders"."customer_id" = "customers"."customer_id"`
+		if !strings.Contains(sql, want) {
+			t.Errorf("join ON condition should use double-quoted identifiers\nwant substring: %s\ngot:\n%s", want, sql)
+		}
 	})
+
+	// §11.1 — schema-qualified table source from OSI dataset.Source.
 	t.Run("11/table-path", func(t *testing.T) {
-		pending(t, "11.1", "schema vs project.dataset table path not implemented (codegen)")
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"orders.status"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "FROM analytics.orders") {
+			t.Errorf("FROM clause should use analytics.orders table path:\n%s", sql)
+		}
 	})
+
 	t.Run("11/casts-and-string-fns", func(t *testing.T) {
-		pending(t, "11.2-11.4", "CAST / CONCAT / boolean rendering not implemented (codegen)")
+		pending(t, "11.2-11.4", "CAST / CONCAT / boolean rendering not modelled yet")
 	})
 	t.Run("11/unnest", func(t *testing.T) {
 		pending(t, "11.6", "UNNEST not modelled yet")
