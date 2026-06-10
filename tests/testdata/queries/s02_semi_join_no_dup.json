@@ -1,1 +1,1 @@
-{"metrics":["orders.order_count"],"dimensions":["customers.tier"]}
+{"metrics":["customers.customer_count"],"dimensions":["customers.region"],"filters":[{"metric":"orders.order_count","group_by":"customers.customer_id","op":">","value":0}]}

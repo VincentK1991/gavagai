@@ -27,6 +27,10 @@ type Renderer interface {
 	//   postgres: analytics.orders -> analytics.orders
 	//   bigquery: my_project.analytics.orders -> `my_project.analytics.orders`
 	QuoteTable(source string) string
+	// NullSafeEq renders the null-safe equality `expr IS NOT DISTINCT FROM lit`
+	// in the dialect's form: PostgreSQL supports the operator natively, while
+	// BigQuery needs the expanded `(expr = lit OR (expr IS NULL AND lit IS NULL))`.
+	NullSafeEq(expr, lit string) string
 }
 
 // EmitSelect renders a plan tree into a SELECT statement using r for the
@@ -111,11 +115,23 @@ func (b *builder) build(n planner.PlanNode) error {
 
 	case *planner.AggregateNode:
 		for _, dim := range t.GroupBy {
-			expr, err := SelectExpression(dim.Field.Expression, b.r.DialectTag())
-			if err != nil {
-				return fmt.Errorf("codegen: dimension %q: %w", dim.Field.Name, err)
+			var expr string
+			if dim.QualifyColumn != "" {
+				// The planner flagged this bare column as ambiguous across joined
+				// datasets; pin it to its own dataset.
+				expr = b.r.QuoteIdent(dim.Dataset) + "." + b.r.QuoteIdent(dim.QualifyColumn)
+			} else {
+				e, err := SelectExpression(dim.Field.Expression, b.r.DialectTag())
+				if err != nil {
+					return fmt.Errorf("codegen: dimension %q: %w", dim.Field.Name, err)
+				}
+				expr = e
 			}
-			b.selects = append(b.selects, expr+" AS "+b.r.QuoteIdent(dim.Field.Name))
+			alias := dim.Field.Name
+			if dim.OutAlias != "" {
+				alias = dim.OutAlias
+			}
+			b.selects = append(b.selects, expr+" AS "+b.r.QuoteIdent(alias))
 			b.groupBy = append(b.groupBy, expr)
 		}
 		for _, met := range t.Aggregates {
@@ -289,9 +305,31 @@ func (b *builder) renderOnePredicate(pred planner.Predicate) (string, error) {
 		}
 		return "(" + strings.Join(parts, " OR ") + ")", nil
 	}
-	expr, err := SelectExpression(pred.Field.Expression, b.r.DialectTag())
-	if err != nil {
-		return "", fmt.Errorf("codegen: filter field %q: %w", pred.Field.Name, err)
+	var expr string
+	if pred.QualifyColumn != "" {
+		// Ambiguous bare column pinned to its dataset by the planner, or a
+		// metric filter's aggregated column referenced through its subquery.
+		expr = b.r.QuoteIdent(pred.Dataset) + "." + b.r.QuoteIdent(pred.QualifyColumn)
+	} else {
+		e, err := SelectExpression(pred.Field.Expression, b.r.DialectTag())
+		if err != nil {
+			return "", fmt.Errorf("codegen: filter field %q: %w", pred.Field.Name, err)
+		}
+		expr = e
+	}
+	if pred.CoalesceZero {
+		// Metric filter null-safety: entities with no contributing rows (NULL
+		// from the LEFT JOIN) compare as 0, making `= 0` a null-safe anti-join.
+		expr = "COALESCE(" + expr + ", 0)"
+	}
+	// Null-safe equality is the one predicate whose surface form diverges per
+	// dialect; defer it to the Renderer.
+	if pred.Op == "IS NOT DISTINCT FROM" {
+		lit, err := renderScalar(pred.Value)
+		if err != nil {
+			return "", fmt.Errorf("codegen: rendering IS NOT DISTINCT FROM value: %w", err)
+		}
+		return b.r.NullSafeEq(expr, lit), nil
 	}
 	return renderPredicate(expr, pred.Op, pred.Value)
 }

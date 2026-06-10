@@ -1,1 +1,1 @@
-{"metrics":["orders.revenue"],"dimensions":["orders.order_month"]}
+{"metrics":["orders.revenue"],"dimensions":["orders.status_label_upper"]}

@@ -1,1 +1,1 @@
-{"metrics":["orders.order_count"],"filters":[{"field":"orders.status","op":"IN","value":["complete","shipped"]}]}
+{"metrics":["customers.customer_count"],"filters":[{"metric":"orders.revenue","group_by":"customers.customer_id","op":">=","value":1000}]}

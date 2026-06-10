@@ -58,6 +58,14 @@ type DimensionExpr struct {
 	Ref     string
 	Dataset string
 	Field   *model.Field
+
+	// QualifyColumn, when non-empty, forces the dimension to render as the
+	// qualified reference Dataset.QualifyColumn instead of its raw expression.
+	// The planner sets it when a bare column would be ambiguous across joined
+	// datasets. OutAlias, when non-empty, overrides the output column alias so
+	// columns that share a name stay distinct.
+	QualifyColumn string
+	OutAlias      string
 }
 
 // Predicate is a resolved filter condition over a dimension field. Value is
@@ -75,6 +83,19 @@ type Predicate struct {
 	// to that scan), or "" when the disjuncts span multiple datasets — in which
 	// case the group stays above the join as a residual filter.
 	Or []Predicate
+
+	// QualifyColumn, when non-empty, forces the predicate's left-hand side to
+	// render as the qualified reference Dataset.QualifyColumn instead of the
+	// field's raw expression — set by the planner when a bare column would be
+	// ambiguous across joined datasets, and by metric filters to reference the
+	// aggregated column of their grouped subquery.
+	QualifyColumn string
+
+	// CoalesceZero wraps the left-hand side in COALESCE(expr, 0). Metric
+	// filters set it so entities with no contributing rows (NULL from the LEFT
+	// JOIN to the grouped subquery) compare as 0 — this is what makes `= 0` a
+	// null-safe anti-join.
+	CoalesceZero bool
 }
 
 // HavingPredicate is a resolved post-aggregation condition over a metric.

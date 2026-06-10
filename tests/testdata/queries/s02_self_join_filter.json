@@ -1,1 +1,1 @@
-{"metrics":["employees.headcount"],"dimensions":["employees.name"],"filters":[{"field":"employees.department","op":"=","value":"Engineering"}]}
+{"metrics":["employees.headcount"],"dimensions":["managers.name"],"filters":[{"field":"employees.department","op":"=","value":"Engineering"},{"field":"managers.department","op":"=","value":"Sales"}]}

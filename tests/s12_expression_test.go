@@ -4,9 +4,11 @@ import "testing"
 
 // §12 — Expression graph / derived expressions
 
-// §12 — PENDING: nested expression reference (derived field referencing another field's expression)
+// §12 — nested expression reference: status_label_upper is declared as
+// UPPER(${status_label}); model loading expands the reference to the target
+// field's (parenthesised) expression before planning.
 func TestNestedExprRef(t *testing.T) {
-	pendingTest(t, "12", "nested-expr-ref",
-		"nested expression graph (field referencing another field's expression) not yet implemented")
-	_ = loadQueryRaw(t, "s12_nested_expr_ref.json")
+	sql := compileSQL(t, "ecommerce.yaml", "s12_nested_expr_ref.json")
+	assertContains(t, sql, "UPPER((CASE WHEN status = 'complete' THEN 'done' ELSE 'pending' END))")
+	assertNotContains(t, sql, "${")
 }

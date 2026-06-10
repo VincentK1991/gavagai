@@ -8,6 +8,7 @@ import (
 	"github.com/vincentk1991/gavagai/internal/codegen"
 	_ "github.com/vincentk1991/gavagai/internal/codegen/bigquery" // registers bigquery dialect
 	_ "github.com/vincentk1991/gavagai/internal/codegen/postgres" // registers postgres dialect
+	"github.com/vincentk1991/gavagai/internal/model"
 	"github.com/vincentk1991/gavagai/internal/planner"
 	"github.com/vincentk1991/gavagai/internal/query"
 )
@@ -321,6 +322,30 @@ func TestFilterPushdown(t *testing.T) {
 			t.Fatalf("below AGGREGATE: want *FilterNode (WHERE), got %T", agg.Input)
 		}
 	})
+
+	// §1.5 — HAVING over COUNT(DISTINCT ...), MIN(...), and MAX(...) renders the
+	// metric's aggregate expression verbatim on the left of the comparison.
+	t.Run("1.5/having-aggregate-functions", func(t *testing.T) {
+		cases := []struct {
+			metric, op string
+			value      float64
+			want       string
+		}{
+			{"orders.order_count", ">", 5, "HAVING COUNT(DISTINCT order_id) > 5"},
+			{"orders.max_amount", ">=", 1000, "HAVING MAX(amount) >= 1000"},
+			{"orders.min_amount", "<", 10, "HAVING MIN(amount) < 10"},
+		}
+		for _, c := range cases {
+			q := &query.Query{
+				Metrics:    []string{c.metric},
+				Dimensions: []string{"orders.status"},
+				Having:     []query.Having{{Metric: c.metric, Op: c.op, Value: c.value}},
+			}
+			if sql := compilePostgres(t, q); !strings.Contains(sql, c.want) {
+				t.Errorf("%s HAVING should render %q:\n%s", c.metric, c.want, sql)
+			}
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -395,14 +420,149 @@ func TestJoinRewriting(t *testing.T) {
 	})
 
 	// §2.2 self-join, §2.3 semi-join, §2.4 anti-join — not expressible yet.
-	t.Run("2.2/self-join", func(t *testing.T) {
-		pending(t, "2.2", "query IR cannot express a self-join (no per-reference alias)")
+	// §2.2 — self-join via a role dataset: `managers` is a second logical
+	// dataset over the same source as `employees` (LookML's `from:` pattern),
+	// so the compiler emits an ordinary join with distinct aliases over the
+	// same physical table. A from==to relationship is rejected by model
+	// validation with a pointer to this pattern.
+	t.Run("2.2/role-dataset-self-join", func(t *testing.T) {
+		m := selfJoinModel()
+		q := &query.Query{Metrics: []string{"employees.headcount"}, Dimensions: []string{"managers.name"}}
+		sql := compileWith(t, m, q, "postgres")
+		if !strings.Contains(sql, `hr.employees AS "employees"`) ||
+			!strings.Contains(sql, `LEFT JOIN hr.employees AS "managers"`) {
+			t.Fatalf("self-join should scan the same table under two aliases:\n%s", sql)
+		}
+		if !strings.Contains(sql, `ON "employees"."manager_id" = "managers"."employee_id"`) {
+			t.Errorf("self-join ON should relate the two roles:\n%s", sql)
+		}
+		// `name` exists on both roles, so the dimension must be qualified.
+		if !strings.Contains(sql, `"managers"."name" AS "name"`) {
+			t.Errorf("role dimension should be qualified to its alias:\n%s", sql)
+		}
 	})
-	t.Run("2.3/semi-join", func(t *testing.T) {
-		pending(t, "2.3", "query IR has no EXISTS/IN-subquery construct")
+
+	// §2.2 — filters distinguish the two roles: each predicate is qualified to
+	// its own alias and pushed to its own scan.
+	t.Run("2.2/self-join-role-filters", func(t *testing.T) {
+		m := selfJoinModel()
+		q := &query.Query{
+			Metrics:    []string{"employees.headcount"},
+			Dimensions: []string{"managers.name"},
+			Filters: []query.Filter{
+				{Field: "employees.department", Op: "=", Value: raw(`"Engineering"`)},
+				{Field: "managers.department", Op: "=", Value: raw(`"Sales"`)},
+			},
+		}
+		p, err := planner.Plan(q, m)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		p = planner.PushDown(p)
+		// Each role's predicate sits above its own scan.
+		got := map[string]bool{}
+		for _, f := range nodesOf[*planner.FilterNode](p) {
+			if scan, ok := f.Input.(*planner.ScanNode); ok && len(f.Predicates) == 1 {
+				got[scan.Alias] = true
+			}
+		}
+		if !got["employees"] || !got["managers"] {
+			t.Errorf("each role's filter should push to its own scan, got %v:\n%s", got, planner.Describe(p))
+		}
+		sql := compileWith(t, m, q, "postgres")
+		if !strings.Contains(sql, `"employees"."department" = 'Engineering'`) ||
+			!strings.Contains(sql, `"managers"."department" = 'Sales'`) {
+			t.Errorf("role filters should be qualified to their aliases:\n%s", sql)
+		}
 	})
-	t.Run("2.4/anti-join", func(t *testing.T) {
-		pending(t, "2.4", "query IR has no NOT EXISTS/NOT IN-subquery construct")
+
+	// §2.2 — an additive metric at the managers grain (the "one" side of the
+	// self-join) is duplicated per report row; the planner refuses it.
+	t.Run("2.2/self-join-fan-out-detected", func(t *testing.T) {
+		m := selfJoinModel()
+		q := &query.Query{Metrics: []string{"managers.total_salary"}, Dimensions: []string{"employees.name"}}
+		_, err := planner.Plan(q, m)
+		var fe *planner.FanOutError
+		if !errors.As(err, &fe) {
+			t.Fatalf("managers-grain SUM across the self-join should fan out, got %v", err)
+		}
+	})
+	// §2.3 — semi-join via metric filter (dbt MetricFlow's Metric() pattern):
+	// `order_count > 0` per customer renders as a grouped subquery LEFT JOINed
+	// on the entity, filtered on the aggregated value.
+	t.Run("2.3/semi-join-metric-filter", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"customers.customer_count"},
+			Filters: []query.Filter{{Metric: "orders.order_count", GroupBy: "customers.customer_id", Op: ">", Value: raw(`0`)}},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "LEFT JOIN (") {
+			t.Fatalf("metric filter should LEFT JOIN a grouped subquery:\n%s", sql)
+		}
+		assertInsideBlock(t, sql, `GROUP BY "customers"."customer_id"`, `) AS "mf0_order_count"`)
+		if !strings.Contains(sql, `ON "customers"."customer_id" = "mf0_order_count"."mf_key"`) {
+			t.Errorf("subquery should join back on the entity:\n%s", sql)
+		}
+		if !strings.Contains(sql, `WHERE COALESCE("mf0_order_count"."order_count", 0) > 0`) {
+			t.Errorf("semi-join should filter the aggregated value > 0:\n%s", sql)
+		}
+	})
+
+	// §2.3 — the subquery GROUPs BY the entity, so it has exactly one row per
+	// entity: the join can never duplicate outer rows.
+	t.Run("2.3/semi-join-no-duplication", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"customers.customer_count"},
+			Dimensions: []string{"customers.region"},
+			Filters:    []query.Filter{{Metric: "orders.order_count", GroupBy: "customers.customer_id", Op: ">", Value: raw(`0`)}},
+		}
+		plan := mustPlan(t, q)
+		subs := nodesOf[*planner.SubqueryNode](plan)
+		if len(subs) != 1 {
+			t.Fatalf("want 1 metric-filter subquery, got %d:\n%s", len(subs), planner.Describe(plan))
+		}
+		agg, ok := subs[0].Input.(*planner.AggregateNode)
+		if !ok {
+			t.Fatalf("metric-filter subquery should wrap an AggregateNode, got %T", subs[0].Input)
+		}
+		if len(agg.GroupBy) != 1 || agg.GroupBy[0].Field.Name != "customer_id" {
+			t.Errorf("subquery must group by the entity (one row per entity), got %+v", agg.GroupBy)
+		}
+	})
+
+	// §2.4 — anti-join is the same construct with `= 0`: entities with no
+	// related rows. COALESCE makes the LEFT JOIN's NULLs compare as 0, so the
+	// pattern is null-safe by construction (no NOT IN null trap).
+	t.Run("2.4/anti-join-metric-filter", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"customers.customer_count"},
+			Filters: []query.Filter{{Metric: "orders.order_count", GroupBy: "customers.customer_id", Op: "=", Value: raw(`0`)}},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "LEFT JOIN (") {
+			t.Fatalf("anti-join should LEFT JOIN the grouped subquery:\n%s", sql)
+		}
+		if !strings.Contains(sql, `WHERE COALESCE("mf0_order_count"."order_count", 0) = 0`) {
+			t.Errorf("anti-join should be the null-safe COALESCE(...) = 0 form:\n%s", sql)
+		}
+	})
+
+	// §2.4 — one null-safe pattern serves both dialects; no NOT IN variant is
+	// needed (NOT IN's NULL semantics are sidestepped entirely).
+	t.Run("2.4/null-safe-both-dialects", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"customers.customer_count"},
+			Filters: []query.Filter{{Metric: "orders.order_count", GroupBy: "customers.customer_id", Op: "=", Value: raw(`0`)}},
+		}
+		for _, dialect := range []string{"postgres", "bigquery"} {
+			sql := compileDialect(t, q, dialect)
+			if !strings.Contains(sql, "COALESCE(") || !strings.Contains(sql, "LEFT JOIN (") {
+				t.Errorf("%s: anti-join should render the null-safe LEFT JOIN + COALESCE pattern:\n%s", dialect, sql)
+			}
+			if strings.Contains(sql, "NOT IN (SELECT") {
+				t.Errorf("%s: anti-join must not use the null-unsafe NOT IN subquery:\n%s", dialect, sql)
+			}
+		}
 	})
 
 	// §2.5 — fan-out detection: unsafe aggregate over the "one" side errors.
@@ -646,6 +806,48 @@ func TestDistinct(t *testing.T) {
 			t.Errorf("dimensions-only query must not emit GROUP BY:\n%s", sql)
 		}
 	})
+
+	// §4 — a multi-dimension, measure-less query dedups on the composite key:
+	// SELECT DISTINCT over every dimension column, still no GROUP BY.
+	t.Run("4/distinct-multi-column", func(t *testing.T) {
+		q := &query.Query{Dimensions: []string{"customers.region", "customers.customer_id"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "SELECT DISTINCT") {
+			t.Fatalf("multi-dimension dedup should emit SELECT DISTINCT:\n%s", sql)
+		}
+		if !strings.Contains(sql, "region") || !strings.Contains(sql, "customer_id") {
+			t.Errorf("both dedup columns should be projected:\n%s", sql)
+		}
+		if strings.Contains(sql, "GROUP BY") {
+			t.Errorf("composite dedup must not emit GROUP BY:\n%s", sql)
+		}
+	})
+
+	// §4 — when a measure is present the query groups; DISTINCT is never added on
+	// top of GROUP BY (the redundant-DISTINCT rewrite is structural here).
+	t.Run("4/distinct-not-redundant-with-groupby", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"orders.status"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "GROUP BY") {
+			t.Errorf("an aggregate query should GROUP BY:\n%s", sql)
+		}
+		if strings.Contains(sql, "SELECT DISTINCT") {
+			t.Errorf("DISTINCT must not be combined with GROUP BY:\n%s", sql)
+		}
+	})
+
+	// §4 / §3.2 — COUNT(DISTINCT col) is a measure rendered inside the aggregate,
+	// not a top-level SELECT DISTINCT.
+	t.Run("4/count-distinct-inside-aggregate", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.order_count"}, Dimensions: []string{"orders.status"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "COUNT(DISTINCT order_id)") {
+			t.Errorf("COUNT(DISTINCT) should render inside the aggregate:\n%s", sql)
+		}
+		if strings.Contains(sql, "SELECT DISTINCT") {
+			t.Errorf("COUNT(DISTINCT) must not produce a top-level SELECT DISTINCT:\n%s", sql)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +941,34 @@ func TestCaseWhen(t *testing.T) {
 			t.Errorf("CASE WHEN dimension should be aliased as status_label:\n%s", sql)
 		}
 	})
+	// §6.1 — a nested CASE WHEN dimension renders its inner CASE verbatim.
+	t.Run("6.1/nested-case-dimension", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.item_count"}, Dimensions: []string{"orders.status_label_nested"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "CASE WHEN status = 'complete' THEN CASE WHEN amount > 100") {
+			t.Errorf("nested CASE WHEN should render verbatim:\n%s", sql)
+		}
+	})
+	// §6.1 — a CASE WHEN dimension with IS NULL / ELSE branches renders verbatim.
+	t.Run("6.1/case-with-null-branch", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.item_count"}, Dimensions: []string{"orders.status_or_unknown"}}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "CASE WHEN status IS NULL THEN 'unknown' ELSE status END") {
+			t.Errorf("CASE WHEN with IS NULL branch should render verbatim:\n%s", sql)
+		}
+	})
+	// §6.3 — a CASE WHEN boolean flag used in a WHERE predicate renders the CASE
+	// expression on the left of the comparison.
+	t.Run("6.3/case-bool-flag-in-where", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{{Field: "orders.is_large_order", Op: "=", Value: raw(`1`)}},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "WHERE CASE WHEN amount > 1000 THEN 1 ELSE 0 END = 1") {
+			t.Errorf("CASE WHEN boolean flag should render as a WHERE predicate:\n%s", sql)
+		}
+	})
 	// §6.2 — SUM/COUNT/AVG over a CASE WHEN all render their conditional inner
 	// expression verbatim inside the aggregate function.
 	t.Run("6.2/case-metric-render", func(t *testing.T) {
@@ -814,8 +1044,40 @@ func TestDateGrain(t *testing.T) {
 			}
 		}
 	})
-	t.Run("7/extract-interval-timezone", func(t *testing.T) {
-		pending(t, "7", "EXTRACT / interval / timezone rewrites not modelled yet")
+	// §7 — EXTRACT day-of-week: PostgreSQL uses DOW, BigQuery DAYOFWEEK. The
+	// dialect-correct form is selected from the model's per-dialect expressions.
+	t.Run("7/extract-dow-dialect-split", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"orders.order_dow"}}
+		if sql := compilePostgres(t, q); !strings.Contains(sql, "EXTRACT(DOW FROM created_at)") {
+			t.Errorf("postgres should render EXTRACT(DOW ...):\n%s", sql)
+		}
+		if sql := compileBigQuery(t, q); !strings.Contains(sql, "EXTRACT(DAYOFWEEK FROM created_at)") {
+			t.Errorf("bigquery should render EXTRACT(DAYOFWEEK ...):\n%s", sql)
+		}
+	})
+
+	// §7 — date arithmetic: interval addition (PostgreSQL/ANSI) vs DATE_ADD
+	// (BigQuery).
+	t.Run("7/date-arithmetic-dialect-split", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"orders.order_next_week"}}
+		if sql := compilePostgres(t, q); !strings.Contains(sql, "created_at + INTERVAL '7 days'") {
+			t.Errorf("postgres should render interval addition:\n%s", sql)
+		}
+		if sql := compileBigQuery(t, q); !strings.Contains(sql, "DATE_ADD(created_at, INTERVAL 7 DAY)") {
+			t.Errorf("bigquery should render DATE_ADD:\n%s", sql)
+		}
+	})
+
+	// §7 — timezone conversion: AT TIME ZONE (PostgreSQL) vs DATETIME(ts, tz)
+	// (BigQuery).
+	t.Run("7/timezone-dialect-split", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.revenue"}, Dimensions: []string{"orders.order_utc"}}
+		if sql := compilePostgres(t, q); !strings.Contains(sql, "created_at AT TIME ZONE 'UTC'") {
+			t.Errorf("postgres should render AT TIME ZONE:\n%s", sql)
+		}
+		if sql := compileBigQuery(t, q); !strings.Contains(sql, "DATETIME(created_at, 'UTC')") {
+			t.Errorf("bigquery should render DATETIME(ts, tz):\n%s", sql)
+		}
 	})
 }
 
@@ -949,11 +1211,47 @@ func TestNullHandling(t *testing.T) {
 			t.Errorf("COUNT(*) should render as COUNT(*):\n%s", starSQL)
 		}
 	})
+	// §9 — the anti-join uses the NULL-generating LEFT JOIN pattern: entities
+	// with no related rows get NULL from the join, and COALESCE(metric, 0) = 0
+	// is the null-safe rendering of the `right.id IS NULL` check.
 	t.Run("9/anti-join-null-check", func(t *testing.T) {
-		pending(t, "9", "LEFT JOIN ... IS NULL anti-join pattern not implemented")
+		q := &query.Query{
+			Metrics: []string{"customers.customer_count"},
+			Filters: []query.Filter{{Metric: "orders.order_count", GroupBy: "customers.customer_id", Op: "=", Value: raw(`0`)}},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "LEFT JOIN (") || !strings.Contains(sql, "COALESCE(") {
+			t.Errorf("anti-join should be a NULL-generating LEFT JOIN with a null-safe check:\n%s", sql)
+		}
 	})
+	// §9 — null-safe equality: PostgreSQL renders the native operator, BigQuery
+	// the expanded null-safe form.
 	t.Run("9/null-safe-equality", func(t *testing.T) {
-		pending(t, "9", "IS NOT DISTINCT FROM / <=> rendering not implemented (codegen)")
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{{Field: "orders.status", Op: "IS NOT DISTINCT FROM", Value: raw(`"complete"`)}},
+		}
+		if sql := compilePostgres(t, q); !strings.Contains(sql, "status IS NOT DISTINCT FROM 'complete'") {
+			t.Errorf("postgres should render the native operator:\n%s", sql)
+		}
+		bq := compileBigQuery(t, q)
+		if !strings.Contains(bq, "(status = 'complete' OR (status IS NULL AND 'complete' IS NULL))") {
+			t.Errorf("bigquery should render the expanded null-safe form:\n%s", bq)
+		}
+	})
+
+	// §9 — COALESCE in a GROUP BY key: a COALESCE dimension groups on the
+	// defaulted expression, so NULLs land in the default group rather than
+	// splitting into their own.
+	t.Run("9/coalesce-group-key", func(t *testing.T) {
+		q := &query.Query{
+			Metrics:    []string{"orders.order_count"},
+			Dimensions: []string{"customers.region_safe"},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "GROUP BY COALESCE(region, 'unknown')") {
+			t.Errorf("COALESCE dimension should appear in the GROUP BY key:\n%s", sql)
+		}
 	})
 }
 
@@ -1152,8 +1450,47 @@ func TestExpressionPassthrough(t *testing.T) {
 		}
 	})
 
+	// §12 — a field expression referencing another field by name (${ref}) is
+	// expanded at model-load time (model.ExpandFieldRefs), per-dialect, with
+	// the spliced expression parenthesised. Cycles and unknown names error.
 	t.Run("12/nested-expression-reference", func(t *testing.T) {
-		pending(t, "12", "field-references-field expression nesting not modelled yet")
+		m := &model.SemanticModel{
+			Name: "nested",
+			Datasets: []model.Dataset{{
+				Name: "items", Source: "s.items",
+				Fields: []model.Field{
+					fld("price", ax("price"), nil),
+					fld("quantity", ax("quantity"), nil),
+					fld("gross", ax("${price} * ${quantity}"), nil),
+					fld("net_label", ax("CAST(${gross} - discount AS TEXT)"), dim()),
+				},
+			}},
+			Metrics: []model.Metric{{Name: "cnt", Expression: ax("COUNT(*)")}},
+		}
+		if err := model.ExpandFieldRefs(m); err != nil {
+			t.Fatalf("ExpandFieldRefs: %v", err)
+		}
+		q := &query.Query{Metrics: []string{"items.cnt"}, Dimensions: []string{"items.net_label"}}
+		sql := compileWith(t, m, q, "postgres")
+		want := "CAST(((price) * (quantity)) - discount AS TEXT)"
+		if !strings.Contains(sql, want) {
+			t.Errorf("nested reference should expand recursively:\nwant %s\ngot:\n%s", want, sql)
+		}
+
+		// A cyclic reference is rejected with a descriptive error.
+		cyclic := &model.SemanticModel{
+			Name: "cyclic",
+			Datasets: []model.Dataset{{
+				Name: "t", Source: "s.t",
+				Fields: []model.Field{
+					fld("a", ax("${b} + 1"), nil),
+					fld("b", ax("${a} + 1"), nil),
+				},
+			}},
+		}
+		if err := model.ExpandFieldRefs(cyclic); err == nil || !strings.Contains(err.Error(), "cyclic") {
+			t.Errorf("cyclic reference should error, got %v", err)
+		}
 	})
 }
 
@@ -1226,7 +1563,66 @@ func TestSafetyRules(t *testing.T) {
 		}
 	})
 
-	t.Run("14/ambiguous-column-error", func(t *testing.T) {
-		pending(t, "14", "ambiguous-column detection not implemented (codegen qualification)")
+	// §14 — when more than one joined dataset exposes the same bare column, the
+	// planner pins each reference to its own dataset and gives the colliding
+	// output columns distinct aliases, so the SQL is never ambiguous.
+	t.Run("14/ambiguous-column-qualified", func(t *testing.T) {
+		m := ambiguousColumnModel()
+		q := &query.Query{Metrics: []string{"a.cnt"}, Dimensions: []string{"a.region", "b.region"}}
+		sql := compileWith(t, m, q, "postgres")
+
+		if !strings.Contains(sql, `"a"."region"`) || !strings.Contains(sql, `"b"."region"`) {
+			t.Errorf("ambiguous columns should be qualified by dataset:\n%s", sql)
+		}
+		if !strings.Contains(sql, `AS "a_region"`) || !strings.Contains(sql, `AS "b_region"`) {
+			t.Errorf("colliding output aliases should be disambiguated:\n%s", sql)
+		}
+		// The bare, ambiguous form must not survive in the GROUP BY either.
+		if strings.Contains(sql, "GROUP BY region") || strings.Contains(sql, "GROUP BY region,") {
+			t.Errorf("GROUP BY must use the qualified columns:\n%s", sql)
+		}
+	})
+
+	// §14 — a single reference to an ambiguous bare column is still qualified
+	// (no alias collision, so the alias is unchanged).
+	t.Run("14/ambiguous-column-single-qualified", func(t *testing.T) {
+		m := ambiguousColumnModel()
+		q := &query.Query{
+			Metrics:    []string{"a.cnt"},
+			Dimensions: []string{"a.region"},
+			Filters:    []query.Filter{{Field: "b.flag", Op: "IS NOT NULL"}},
+		}
+		sql := compileWith(t, m, q, "postgres")
+		if !strings.Contains(sql, `"a"."region" AS "region"`) {
+			t.Errorf("a single ambiguous column should be qualified, alias unchanged:\n%s", sql)
+		}
+	})
+
+	// §14 — an always-false predicate is not special-cased: it compiles to valid
+	// SQL whose WHERE carries the (runtime-empty) condition.
+	t.Run("14/empty-result-guard", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.item_count"},
+			Filters: []query.Filter{{Field: "orders.status", Op: "=", Value: raw(`"__never__"`)}},
+		}
+		sql := compilePostgres(t, q)
+		if !strings.Contains(sql, "WHERE status = '__never__'") {
+			t.Errorf("always-false predicate should still render as a WHERE:\n%s", sql)
+		}
+		if !strings.HasPrefix(sql, "SELECT") {
+			t.Errorf("output should still be a valid SELECT:\n%s", sql)
+		}
+	})
+
+	// §14 — a LIMIT at the 32-bit max renders verbatim. Both target dialects
+	// accept 64-bit LIMIT values, so no clamping or overflow occurs.
+	t.Run("14/limit-fits-dialect-integer", func(t *testing.T) {
+		q := &query.Query{Metrics: []string{"orders.item_count"}, Limit: intp(2147483647)}
+		if sql := compilePostgres(t, q); !strings.Contains(sql, "LIMIT 2147483647") {
+			t.Errorf("postgres LIMIT should render verbatim:\n%s", sql)
+		}
+		if sql := compileBigQuery(t, q); !strings.Contains(sql, "LIMIT 2147483647") {
+			t.Errorf("bigquery LIMIT should render verbatim:\n%s", sql)
+		}
 	})
 }

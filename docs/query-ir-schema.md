@@ -68,6 +68,45 @@ All references use dot-qualified names: `dataset_name.element_name`.
 | `NOT IN` | array | `"value": ["pending", "cancelled"]` |
 | `IS NULL` | — | no value |
 | `IS NOT NULL` | — | no value |
+| `IS NOT DISTINCT FROM` | scalar | `"value": "complete"` — null-safe equality; native on PostgreSQL, expanded to `(a = b OR (a IS NULL AND b IS NULL))` on BigQuery |
+
+### Metric filters (semi-join / anti-join)
+
+A filter may instead compare an **aggregated metric per entity** — dbt
+MetricFlow's `Metric('m', group_by=['entity'])` pattern. Set `metric` and
+`group_by` instead of `field`:
+
+```json
+{
+  "metric":   "<dataset>.<metric_name>",
+  "group_by": "<dataset>.<field_name>",
+  "op":       "<comparison operator>",
+  "value":    <number>
+}
+```
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `metric` | string | yes | Metric to aggregate per entity |
+| `group_by` | string | yes | The entity: a plain-column field of the outer dataset being filtered; the metric's dataset must be join-reachable from it |
+| `op` | string | yes | One of `=`, `!=`, `>`, `>=`, `<`, `<=` |
+| `value` | number | yes | Numeric threshold |
+
+The compiler aggregates the metric to the entity grain in a grouped subquery,
+LEFT JOINs it onto the outer query on the entity, and compares
+`COALESCE(metric, 0)` with the threshold. Entities with no related rows
+compare as 0, so:
+
+- `"op": ">", "value": 0` — **semi-join**: entities WITH related rows
+  (e.g. customers who have orders);
+- `"op": "=", "value": 0` — **anti-join**: entities WITHOUT related rows
+  (null-safe by construction);
+- any other threshold — existence with a floor, e.g. customers with
+  ≥ 1000 total revenue.
+
+Metric filters AND-combine with ordinary filters and are not allowed inside
+`or` groups. See `docs/metric-filters.md` for the design rationale and the
+generated SQL.
 
 ---
 

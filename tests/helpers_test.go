@@ -29,7 +29,12 @@ func loadModel(t *testing.T, name string) *model.SemanticModel {
 	if len(doc.Models) == 0 {
 		t.Fatalf("loadModel %s: no models in document", name)
 	}
-	return &doc.Models[0]
+	m := &doc.Models[0]
+	// Mirror pipeline.loadModel: expand ${field} expression references.
+	if err := model.ExpandFieldRefs(m); err != nil {
+		t.Fatalf("loadModel %s: expand field refs: %v", name, err)
+	}
+	return m
 }
 
 func loadQuery(t *testing.T, name string) *query.Query {

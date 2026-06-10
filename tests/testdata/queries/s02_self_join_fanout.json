@@ -1,1 +1,1 @@
-{"metrics":["employees.total_salary"],"dimensions":["employees.department"]}
+{"metrics":["managers.total_salary"],"dimensions":["employees.name"]}

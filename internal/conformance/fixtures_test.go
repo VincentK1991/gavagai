@@ -91,6 +91,12 @@ func ecommerceModel(t *testing.T) *model.SemanticModel {
 					), timeDim()),
 					// status_label is a CASE WHEN dimension.
 					fld("status_label", ax("CASE WHEN status = 'complete' THEN 'done' ELSE 'pending' END"), dim()),
+					// §6.1 — nested CASE WHEN inside a dimension.
+					fld("status_label_nested", ax("CASE WHEN status = 'complete' THEN CASE WHEN amount > 100 THEN 'big done' ELSE 'small done' END ELSE 'pending' END"), dim()),
+					// §6.1 — CASE WHEN with IS NULL / IS NOT NULL branches.
+					fld("status_or_unknown", ax("CASE WHEN status IS NULL THEN 'unknown' ELSE status END"), dim()),
+					// §6.3 — CASE WHEN as a virtual boolean flag (filterable in WHERE).
+					fld("is_large_order", ax("CASE WHEN amount > 1000 THEN 1 ELSE 0 END"), dim()),
 					// order_quarter / order_year exercise the other DATE_TRUNC grains.
 					fld("order_quarter", dx(
 						[2]string{"ANSI_SQL", "DATE_TRUNC('quarter', created_at)"},
@@ -99,6 +105,23 @@ func ecommerceModel(t *testing.T) *model.SemanticModel {
 					fld("order_year", dx(
 						[2]string{"ANSI_SQL", "DATE_TRUNC('year', created_at)"},
 						[2]string{"BIGQUERY", "DATE_TRUNC(created_at, YEAR)"},
+					), timeDim()),
+					// §7 — EXTRACT day-of-week: function name differs per dialect
+					// (DOW vs DAYOFWEEK), with no ANSI fallback.
+					fld("order_dow", dx(
+						[2]string{"POSTGRES", "EXTRACT(DOW FROM created_at)"},
+						[2]string{"BIGQUERY", "EXTRACT(DAYOFWEEK FROM created_at)"},
+					), timeDim()),
+					// §7 — date arithmetic: interval addition vs DATE_ADD.
+					fld("order_next_week", dx(
+						[2]string{"ANSI_SQL", "created_at + INTERVAL '7 days'"},
+						[2]string{"POSTGRES", "created_at + INTERVAL '7 days'"},
+						[2]string{"BIGQUERY", "DATE_ADD(created_at, INTERVAL 7 DAY)"},
+					), timeDim()),
+					// §7 — timezone conversion: AT TIME ZONE vs DATETIME(ts, tz).
+					fld("order_utc", dx(
+						[2]string{"POSTGRES", "created_at AT TIME ZONE 'UTC'"},
+						[2]string{"BIGQUERY", "DATETIME(created_at, 'UTC')"},
 					), timeDim()),
 					// broken has no ANSI_SQL and no target dialect -> missing-expression error.
 					fld("broken", dx([2]string{"SNOWFLAKE", "broken"}), dim()),
@@ -133,12 +156,14 @@ func ecommerceModel(t *testing.T) *model.SemanticModel {
 			{Name: "item_count", Expression: ax("COUNT(*)")},                                                         // fan-out unsafe
 			{Name: "aov", Expression: ax("AVG(amount)")},                                                             // fan-out unsafe
 			{Name: "max_amount", Expression: ax("MAX(amount)")},                                                      // fan-out safe
+			{Name: "min_amount", Expression: ax("MIN(amount)")},                                                      // fan-out safe
 			{Name: "completed_revenue", Expression: ax("SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)")}, // SUM(CASE …)
 			{Name: "completed_count", Expression: ax("COUNT(CASE WHEN status = 'complete' THEN 1 END)")},             // COUNT(CASE …)
 			{Name: "avg_completed", Expression: ax("AVG(CASE WHEN status = 'complete' THEN amount END)")},            // AVG(CASE …)
 			{Name: "gross_revenue", Expression: ax("SUM(price * quantity)")},                                         // SUM(expr) on order_items grain
 			{Name: "priced_lines", Expression: ax("COUNT(price)")},                                                   // COUNT(col) excludes NULLs
 			{Name: "safe_ratio", Expression: ax("SUM(amount) / NULLIF(COUNT(*), 0)")},                                // NULLIF guards divide-by-zero
+			{Name: "customer_count", Expression: ax("COUNT(DISTINCT customer_id)")},                                  // customers-grain count (metric filter gates)
 		},
 	}
 }
@@ -158,6 +183,63 @@ func compositeKeyModel() *model.SemanticModel {
 		},
 		Relationships: []model.Relationship{
 			{Name: "a_to_b", From: "a", To: "b", FromColumns: []string{"k1", "k2"}, ToColumns: []string{"k1", "k2"}},
+		},
+		Metrics: []model.Metric{{Name: "cnt", Expression: ax("COUNT(*)")}},
+	}
+}
+
+// selfJoinModel models an org hierarchy with a ROLE DATASET: `managers` is a
+// second logical dataset over the same physical source as `employees`, and
+// the employee→manager relationship relates the two names. This is how
+// gavagai expresses self-joins (LookML's `from:` alias pattern) — the planner
+// and codegen need no special casing, since it is an ordinary join between
+// two datasets that happen to share a source.
+func selfJoinModel() *model.SemanticModel {
+	role := func(name string, withManagerID bool) model.Dataset {
+		fields := []model.Field{
+			fld("employee_id", ax("employee_id"), nil),
+			fld("name", ax("name"), dim()),
+			fld("department", ax("department"), dim()),
+			fld("salary", ax("salary"), nil),
+		}
+		if withManagerID {
+			fields = append(fields, fld("manager_id", ax("manager_id"), nil))
+		}
+		return model.Dataset{Name: name, Source: "hr.employees", PrimaryKey: []string{"employee_id"}, Fields: fields}
+	}
+	return &model.SemanticModel{
+		Name:     "org_hierarchy",
+		Datasets: []model.Dataset{role("employees", true), role("managers", false)},
+		Relationships: []model.Relationship{
+			// employees (many) -> managers (one): each employee has one manager.
+			{Name: "employee_to_manager", From: "employees", To: "managers",
+				FromColumns: []string{"manager_id"}, ToColumns: []string{"employee_id"}},
+		},
+		Metrics: []model.Metric{
+			{Name: "headcount", Expression: ax("COUNT(*)")},
+			{Name: "total_salary", Expression: ax("SUM(salary)")}, // fan-out unsafe at the managers grain
+		},
+	}
+}
+
+// ambiguousColumnModel has two related datasets that both expose a bare
+// `region` column, for the ambiguous-column qualification gate.
+func ambiguousColumnModel() *model.SemanticModel {
+	return &model.SemanticModel{
+		Name: "ambig",
+		Datasets: []model.Dataset{
+			{Name: "a", Source: "s.a", PrimaryKey: []string{"id"}, Fields: []model.Field{
+				fld("id", ax("id"), nil),
+				fld("region", ax("region"), dim()),
+			}},
+			{Name: "b", Source: "s.b", PrimaryKey: []string{"id"}, Fields: []model.Field{
+				fld("id", ax("id"), nil),
+				fld("region", ax("region"), dim()),
+				fld("flag", ax("flag"), dim()),
+			}},
+		},
+		Relationships: []model.Relationship{
+			{Name: "a_to_b", From: "a", To: "b", FromColumns: []string{"id"}, ToColumns: []string{"id"}},
 		},
 		Metrics: []model.Metric{{Name: "cnt", Expression: ax("COUNT(*)")}},
 	}

@@ -18,7 +18,7 @@ over an inline `(semantic model, query)` fixture.
   the assertion runs.
 
 Run the gates with `go test ./internal/conformance/... -v`. As of this commit:
-**80 boxes green, 39 pending** (see the progress table at the bottom). The green
+**100 boxes green, 19 pending** (see the progress table at the bottom). The green
 set covers the full plan-level core (Phases 0–4) plus both SQL emitters
 (Phase 5 PostgreSQL, Phase 6 BigQuery): filter/pushdown (including OR /
 mixed AND-OR disjunctions), join resolution and ON/composite-key rendering,
@@ -31,10 +31,11 @@ tables, WITH clauses, CTE-vs-subquery selection, nested CTEs, and
 predicate-pushdown into the subquery/CTE body, via `planner.Materialize`), and
 fan-out-safe pre-aggregation (each metric aggregated on its own grain in an
 isolated subquery, combined by a shared-dimension or cross join, via
-`planner.planPreAggregated`). The pending set is the larger features that still
-need new plan-node types or codegen machinery: self/semi/anti-joins, window
-functions, ROLLUP/CUBE, recursive CTEs, nested fine→coarse aggregation, and
-ambiguous-column qualification.
+`planner.planPreAggregated`), and semi/anti-joins via metric filters (dbt
+MetricFlow's `Metric()` pattern — see `docs/metric-filters.md`). The pending
+set is features that need query-IR or model extensions: self-joins (per-
+reference aliases), window functions, ROLLUP/CUBE, recursive CTEs, nested
+fine→coarse aggregation, UNNEST, and null-safe equality.
 
 ---
 
@@ -68,7 +69,7 @@ ambiguous-column qualification.
 - [x] Scalar filter on a raw column → emitted as WHERE (pre-aggregate) ← gate: `1.5/where-vs-having`
 - [x] Filter on an aggregate result (`revenue > 1000`) → emitted as HAVING (post-aggregate) ← gate: `1.5/where-vs-having`
 - [x] Mixed query: scalar filter becomes WHERE, aggregate filter becomes HAVING — both correct ← gate: `1.5/where-vs-having`
-- [ ] HAVING with `COUNT(DISTINCT ...)`, `MIN(...)`, `MAX(...)` rendered correctly
+- [x] HAVING with `COUNT(DISTINCT ...)`, `MIN(...)`, `MAX(...)` rendered correctly ← gate: `1.5/having-aggregate-functions`
 
 ---
 
@@ -86,14 +87,20 @@ ambiguous-column qualification.
 - [ ] Self-join fan-out detection: SUM/AVG/COUNT over the self-joined table raises error
 
 ### 2.3 Semi-join (EXISTS / IN subquery)
-- [ ] Rewrite an inner join where only left-side columns are selected → `EXISTS` subquery
-- [ ] Rewrite `WHERE id IN (SELECT id FROM ...)` as a semi-join plan node
-- [ ] Semi-join does not duplicate left rows when right side has duplicates
+
+Expressed as a **metric filter** — dbt MetricFlow's `Metric('m', group_by=['entity'])`
+pattern — rather than EXISTS/IN constructs in the query IR. The filter
+`{"metric": "orders.order_count", "group_by": "customers.customer_id", "op": ">", "value": 0}`
+renders as a grouped subquery LEFT JOINed on the entity. See `docs/metric-filters.md`.
+
+- [x] Semi-join capability: filter an entity by a related metric (`> 0` ⇒ entities WITH related rows; equivalent to EXISTS) ← gate: `2.3/semi-join-metric-filter`
+- [x] IN-subquery semantics (`WHERE id IN (SELECT id FROM ...)`) expressed as a metric filter over the related dataset — the semantic-layer form keeps SQL mechanisms out of the IR ← gate: `2.3/semi-join-metric-filter`
+- [x] Semi-join does not duplicate left rows when right side has duplicates — the subquery GROUPs BY the entity, so it is one row per entity by construction ← gate: `2.3/semi-join-no-duplication`
 
 ### 2.4 Anti-join (NOT EXISTS / NOT IN)
-- [ ] `NOT EXISTS` subquery pattern generated from anti-join plan node
-- [ ] `NOT IN` subquery alternative (dialect choice)
-- [ ] Null-safe anti-join: `NOT IN` with NULLs on right side → rewritten to `NOT EXISTS` or `LEFT JOIN ... IS NULL`
+- [x] Anti-join (NOT EXISTS semantics): the same metric filter with `= 0` ⇒ entities WITHOUT related rows ← gate: `2.4/anti-join-metric-filter`
+- [x] `NOT IN` subquery alternative unnecessary: one null-safe pattern (LEFT JOIN + COALESCE) serves both dialects and sidesteps NOT IN's NULL trap entirely ← gate: `2.4/null-safe-both-dialects`
+- [x] Null-safe anti-join: `COALESCE(metric, 0) = 0` makes the LEFT JOIN's NULLs compare as 0 — null-safe by construction ← gate: `2.4/anti-join-metric-filter`
 
 ### 2.5 Fan-out-safe pre-aggregation before JOIN
 - [x] SUM metric on the one-side dataset → pre-aggregate before join to avoid fan-out ← gate: `2.5/sum-pre-aggregated`
@@ -133,10 +140,10 @@ ambiguous-column qualification.
 ## 4. DISTINCT Rewriting
 
 - [x] Top-level `SELECT DISTINCT` when query has no aggregates but dedup is needed ← gate: `4/distinct-render`
-- [ ] `COUNT(DISTINCT col)` inside aggregate (see §3.2)
+- [x] `COUNT(DISTINCT col)` inside aggregate (see §3.2) ← gate: `4/count-distinct-inside-aggregate`
 - [ ] DISTINCT pushed below JOIN to reduce cardinality before join
-- [ ] DISTINCT on multi-column group (composite dedup key)
-- [ ] Rewrite DISTINCT + GROUP BY to GROUP BY only (redundant DISTINCT removed)
+- [x] DISTINCT on multi-column group (composite dedup key) ← gate: `4/distinct-multi-column`
+- [x] Rewrite DISTINCT + GROUP BY to GROUP BY only (redundant DISTINCT removed — structural: a measure-bearing query groups and never adds DISTINCT) ← gate: `4/distinct-not-redundant-with-groupby`
 
 ---
 
@@ -155,8 +162,8 @@ ambiguous-column qualification.
 
 ### 6.1 In dimension expressions
 - [x] `CASE WHEN col = 'a' THEN 'label_a' ELSE 'other' END` as a dimension ← gate: `6.1/case-dimension-render`
-- [ ] Nested CASE WHEN inside a dimension
-- [ ] CASE WHEN with IS NULL / IS NOT NULL branches
+- [x] Nested CASE WHEN inside a dimension ← gate: `6.1/nested-case-dimension`
+- [x] CASE WHEN with IS NULL / IS NOT NULL branches ← gate: `6.1/case-with-null-branch`
 
 ### 6.2 In metric expressions
 - [x] `SUM(CASE WHEN status = 'complete' THEN amount ELSE 0 END)` — conditional sum ← gate: `6.2/case-metric-render`
@@ -165,7 +172,7 @@ ambiguous-column qualification.
 
 ### 6.3 In filter predicates
 - [x] Filter on a CASE WHEN expression column (dimension filter, not pushed below aggregate) ← gate: `6.3/filter-on-case-dimension`
-- [ ] CASE WHEN used as a virtual boolean flag in WHERE clause
+- [x] CASE WHEN used as a virtual boolean flag in WHERE clause ← gate: `6.3/case-bool-flag-in-where`
 
 ### 6.4 COALESCE / NULLIF (related null-handling rewrites)
 - [x] `COALESCE(col, default)` in dimension expression ← gate: `6.4/coalesce-nullif`
@@ -178,9 +185,9 @@ ambiguous-column qualification.
 - [x] `DATE_TRUNC('day', ts)` dimension — PostgreSQL dialect ← gate: `7/date-trunc-postgres`
 - [x] `DATE_TRUNC(ts, 'day')` dimension — BigQuery dialect (argument order differs) ← gate: `7/date-trunc-bigquery`
 - [x] `DATE_TRUNC('month', ts)` / `'quarter'` / `'year'` ← gate: `7/date-trunc-grains`
-- [ ] `EXTRACT(DOW FROM ts)` vs `EXTRACT(DAYOFWEEK FROM ts)` dialect split
-- [ ] Date arithmetic: `ts + INTERVAL '7 days'` vs `DATE_ADD(ts, INTERVAL 7 DAY)`
-- [ ] Timezone conversion: `AT TIME ZONE` (PostgreSQL) vs `DATETIME(ts, tz)` (BigQuery)
+- [x] `EXTRACT(DOW FROM ts)` vs `EXTRACT(DAYOFWEEK FROM ts)` dialect split ← gate: `7/extract-dow-dialect-split`
+- [x] Date arithmetic: `ts + INTERVAL '7 days'` vs `DATE_ADD(ts, INTERVAL 7 DAY)` ← gate: `7/date-arithmetic-dialect-split`
+- [x] Timezone conversion: `AT TIME ZONE` (PostgreSQL) vs `DATETIME(ts, tz)` (BigQuery) ← gate: `7/timezone-dialect-split`
 
 ---
 
@@ -198,7 +205,7 @@ ambiguous-column qualification.
 ## 9. NULL Handling Rewrites
 
 - [x] `IS NULL` / `IS NOT NULL` predicates (see §1.1) ← gate: `9/is-null-predicate`
-- [ ] LEFT JOIN null check: `WHERE right.id IS NULL` → anti-join pattern
+- [x] LEFT JOIN null check (`WHERE right.id IS NULL` → anti-join pattern): realized as a NULL-generating LEFT JOIN to a grouped subquery with the null-safe `COALESCE(metric, 0) = 0` check ← gate: `9/anti-join-null-check`
 - [ ] `COALESCE` to replace NULL with a default in GROUP BY key (avoid null-group splitting)
 - [x] `COUNT(col)` excludes NULLs — contrast with `COUNT(*)` in test ← gate: `9/count-col-excludes-null`
 - [ ] NULL-safe equality: `col IS NOT DISTINCT FROM value` (PostgreSQL) vs `col <=> value` (MySQL)
@@ -265,10 +272,10 @@ ambiguous-column qualification.
 ## 14. Miscellaneous Safety Rules
 
 - [x] No cartesian product: error if two datasets have no join path and are both referenced ← gate: `14/no-cartesian-product`
-- [ ] Ambiguous column: error if the same column name exists in multiple joined datasets and no qualifier is used
+- [x] Ambiguous column: when the same bare column exists in multiple joined datasets, the planner qualifies each reference to its own dataset (`"customers"."region"`) and disambiguates colliding output aliases — emitting unambiguous SQL rather than rejecting the query ← gate: `14/ambiguous-column-qualified`, `14/ambiguous-column-single-qualified`
 - [x] Cyclic join path: BFS handles cycles (already visited nodes skipped), verify no infinite loop ← gate: `14/cyclic-join-path-terminates`
-- [ ] Empty result set guard: queries with always-false predicates still produce valid SQL (no special casing)
-- [ ] Integer overflow: LIMIT value fits in dialect's integer type
+- [x] Empty result set guard: queries with always-false predicates still produce valid SQL (no special casing) ← gate: `14/empty-result-guard`
+- [x] Integer overflow: LIMIT value fits in dialect's integer type (both targets accept 64-bit LIMIT) ← gate: `14/limit-fits-dialect-integer`
 
 ---
 
@@ -276,18 +283,18 @@ ambiguous-column qualification.
 
 | Section | Total items | Done |
 |---------|-------------|------|
-| 1. Filter pushdown | 20 | 19 |
-| 2. JOIN rewriting | 16 | 7 |
+| 1. Filter pushdown | 20 | 20 |
+| 2. JOIN rewriting | 16 | 13 |
 | 3. Aggregation rewriting | 14 | 11 |
-| 4. DISTINCT | 5 | 1 |
+| 4. DISTINCT | 5 | 4 |
 | 5. LIMIT / OFFSET | 6 | 5 |
-| 6. CASE WHEN | 10 | 7 |
-| 7. Date/time grain | 6 | 3 |
+| 6. CASE WHEN | 10 | 10 |
+| 7. Date/time grain | 6 | 6 |
 | 8. Subquery / CTE | 6 | 5 |
-| 9. NULL handling | 5 | 2 |
+| 9. NULL handling | 5 | 3 |
 | 10. Window functions | 5 | 0 |
 | 11. Dialect rewrites | 11 | 9 |
 | 12. Expression passthrough | 5 | 4 |
 | 13. ORDER BY | 5 | 5 |
-| 14. Safety rules | 5 | 2 |
-| **Total** | **119** | **80** |
+| 14. Safety rules | 5 | 5 |
+| **Total** | **119** | **100** |

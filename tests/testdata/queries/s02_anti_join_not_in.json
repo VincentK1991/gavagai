@@ -1,1 +1,1 @@
-{"metrics":["orders.order_count"],"filters":[{"field":"orders.status","op":"NOT IN","value":["cancelled","refunded"]}]}
+{"metrics":["customers.customer_count"],"filters":[{"metric":"orders.order_count","group_by":"customers.customer_id","op":"=","value":0}]}

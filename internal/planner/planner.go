@@ -33,6 +33,10 @@ func Plan(q *query.Query, m *model.SemanticModel) (PlanNode, error) {
 	if err != nil {
 		return nil, err
 	}
+	mfs, err := resolveMetricFilters(q.Filters, idx)
+	if err != nil {
+		return nil, err
+	}
 	havings, err := resolveHaving(q.Having, idx)
 	if err != nil {
 		return nil, err
@@ -50,12 +54,31 @@ func Plan(q *query.Query, m *model.SemanticModel) (PlanNode, error) {
 		// A fan-out is unsafe to compute in a single pass. Try the pre-
 		// aggregation rewrite (each metric aggregated on its own grain, results
 		// combined); fall back to the descriptive FanOutError if it declines.
+		// Metric filters are not supported on the pre-aggregated path.
+		if len(mfs) > 0 {
+			return nil, ferr
+		}
 		pre, perr := planPreAggregated(m, metrics, dims, preds, havings)
 		if perr != nil {
 			return nil, ferr
 		}
 		node = pre
 	} else {
+		// Qualify any bare column that more than one joined dataset exposes, so
+		// the emitted SQL is unambiguous.
+		dims, preds = qualifyAmbiguousColumns(dims, preds, scanDatasets(base))
+
+		// Each metric filter LEFT JOINs a grouped subquery onto the tree and
+		// contributes a WHERE predicate on the aggregated value.
+		for i, mf := range mfs {
+			joined, pred, err := applyMetricFilter(base, mf, i, m)
+			if err != nil {
+				return nil, err
+			}
+			base = joined
+			preds = append(preds, pred)
+		}
+
 		node = base
 		if len(preds) > 0 {
 			node = &FilterNode{Input: node, Predicates: preds}
@@ -147,6 +170,9 @@ func resolveDimensions(refs []string, idx *index) ([]DimensionExpr, error) {
 func resolveFilters(filters []query.Filter, idx *index) ([]Predicate, error) {
 	out := make([]Predicate, 0, len(filters))
 	for _, f := range filters {
+		if f.Metric != "" {
+			continue // metric filters are resolved by resolveMetricFilters
+		}
 		if len(f.Or) > 0 {
 			group := make([]Predicate, 0, len(f.Or))
 			for _, sub := range f.Or {
@@ -261,6 +287,11 @@ func referencedDatasets(q *query.Query) []string {
 	}
 	for _, f := range q.Filters {
 		addRef(f.Field)
+		if f.Metric != "" {
+			// A metric filter joins its subquery onto the group_by entity, so the
+			// entity's dataset must be present in the outer tree.
+			addRef(f.GroupBy)
+		}
 	}
 	for _, h := range q.Having {
 		addRef(h.Metric)

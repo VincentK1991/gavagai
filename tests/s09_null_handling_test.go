@@ -11,16 +11,21 @@ func TestCoalesceGroupby(t *testing.T) {
 	assertContains(t, sql, "GROUP BY")
 }
 
-// PENDING §9 — null-safe equality filter (IS NOT DISTINCT FROM)
+// §9 — null-safe equality filter: native IS NOT DISTINCT FROM on PostgreSQL,
+// expanded (a = b OR (a IS NULL AND b IS NULL)) on BigQuery.
 func TestNullSafeEq(t *testing.T) {
-	pendingTest(t, "9", "null-safe-eq",
-		"IS NOT DISTINCT FROM / null-safe equality operator not yet in the query IR")
-	_ = loadQueryRaw(t, "s09_null_safe_eq.json")
+	pgSQL := compileSQLDialect(t, "ecommerce.yaml", "s09_null_safe_eq.json", "postgres")
+	assertContains(t, pgSQL, "status IS NOT DISTINCT FROM 'complete'")
+
+	bqSQL := compileSQLDialect(t, "ecommerce.yaml", "s09_null_safe_eq.json", "bigquery")
+	assertContains(t, bqSQL, "(status = 'complete' OR (status IS NULL AND 'complete' IS NULL))")
 }
 
-// PENDING §9 — anti-join via NULL-generating outer join
+// §9 — anti-join via the NULL-generating outer join: customers with no orders
+// get NULL from the LEFT JOIN to the grouped subquery, and the null-safe
+// COALESCE(metric, 0) = 0 check realizes the `right.id IS NULL` pattern.
 func TestAntiJoinNull(t *testing.T) {
-	pendingTest(t, "9", "anti-join-null",
-		"NULL-generating anti-join pattern not yet supported by the planner")
-	_ = loadQueryRaw(t, "s09_anti_join_null.json")
+	sql := compileSQL(t, "ecommerce.yaml", "s09_anti_join_null.json")
+	assertContains(t, sql, "LEFT JOIN (")
+	assertContains(t, sql, `COALESCE("mf0_order_count"."order_count", 0) = 0`)
 }

@@ -26,13 +26,20 @@ func validModel() *model.SemanticModel {
 					{Name: "region", Expression: ansi("region")},
 				},
 			},
+			{
+				Name:   "customers",
+				Source: "analytics.public.customers",
+				Fields: []model.Field{
+					{Name: "customer_id", Expression: ansi("customer_id")},
+				},
+			},
 		},
 		Metrics: []model.Metric{
 			{Name: "revenue", Expression: ansi("SUM(orders.amount)")},
 		},
 		Relationships: []model.Relationship{
 			{
-				Name: "r", From: "orders", To: "orders",
+				Name: "r", From: "orders", To: "customers",
 				FromColumns: []string{"a"}, ToColumns: []string{"b"},
 			},
 		},
@@ -133,6 +140,13 @@ func TestValidateRules(t *testing.T) {
 				m.Relationships[0].To = "nonexistent"
 			},
 			wantSub: "nonexistent",
+		},
+		{
+			name: "self-relationship rejected (use a role dataset)",
+			mutate: func(m *model.SemanticModel) {
+				m.Relationships[0].To = "orders"
+			},
+			wantSub: "role dataset",
 		},
 	}
 

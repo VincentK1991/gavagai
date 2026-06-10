@@ -82,6 +82,18 @@ func Validate(m *SemanticModel) []ValidationError {
 		if len(r.FromColumns) != len(r.ToColumns) && len(r.FromColumns) > 0 && len(r.ToColumns) > 0 {
 			add(path, "from_columns and to_columns must have equal length")
 		}
+
+		// A relationship from a dataset to itself is inert: the query IR cannot
+		// name the two sides distinctly, so the planner would never produce the
+		// join. Self-joins are modelled with a role dataset instead — a second
+		// logical dataset over the same source (e.g. `managers` with the same
+		// source as `employees`) and a relationship between the two names.
+		if r.From != "" && r.From == r.To {
+			add(path, fmt.Sprintf(
+				"relationship %q joins dataset %q to itself; declare a role dataset "+
+					"(a second dataset with the same source under a different name) "+
+					"and relate the two names instead", r.Name, r.From))
+		}
 	}
 
 	return errs

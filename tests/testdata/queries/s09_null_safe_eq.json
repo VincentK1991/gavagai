@@ -1,1 +1,1 @@
-{"metrics":["orders.revenue"],"filters":[{"field":"orders.status","op":"=","value":"complete"}]}
+{"metrics":["orders.revenue"],"filters":[{"field":"orders.status","op":"IS NOT DISTINCT FROM","value":"complete"}]}

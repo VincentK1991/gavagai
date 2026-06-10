@@ -93,6 +93,11 @@ func loadModel(path string) (*model.SemanticModel, error) {
 	if verrs := model.Validate(m); len(verrs) > 0 {
 		return nil, fmt.Errorf("invalid model %q:\n%s", path, joinErrors(verrs))
 	}
+	// Expand ${field} references in field expressions so the planner and
+	// emitters only ever see plain expressions (checklist §12).
+	if err := model.ExpandFieldRefs(m); err != nil {
+		return nil, fmt.Errorf("invalid model %q: %w", path, err)
+	}
 	return m, nil
 }
 

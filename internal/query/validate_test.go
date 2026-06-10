@@ -1,6 +1,7 @@
 package query_test
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -294,6 +295,63 @@ func TestValidateOrFilter(t *testing.T) {
 			}}},
 		}
 		expectErrorContaining(t, "bad field in or", "nonexistent_col", query.Validate(q, m))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Metric filters (semi/anti-join construct) — see docs/metric-filters.md.
+// ---------------------------------------------------------------------------
+
+func TestValidateMetricFilter(t *testing.T) {
+	m := loadEcommerceModel(t)
+	mf := func(metric, groupBy, op string, value string) query.Filter {
+		f := query.Filter{Metric: metric, GroupBy: groupBy, Op: op}
+		if value != "" {
+			f.Value = json.RawMessage(value)
+		}
+		return f
+	}
+
+	t.Run("valid semi and anti forms", func(t *testing.T) {
+		for _, f := range []query.Filter{
+			mf("orders.order_count", "customers.customer_id", ">", "0"),
+			mf("orders.order_count", "customers.customer_id", "=", "0"),
+			mf("orders.revenue", "customers.customer_id", ">=", "1000"),
+		} {
+			q := &query.Query{Metrics: []string{"orders.revenue"}, Filters: []query.Filter{f}}
+			expectNoErrors(t, "metric filter", query.Validate(q, m))
+		}
+	})
+
+	cases := []struct {
+		name string
+		f    query.Filter
+		want string
+	}{
+		{"unknown metric", mf("orders.nope", "customers.customer_id", ">", "0"), "unknown metric"},
+		{"unknown group_by field", mf("orders.order_count", "customers.nope", ">", "0"), `unknown field "nope"`},
+		{"missing group_by", mf("orders.order_count", "", ">", "0"), "requires group_by"},
+		{"non-comparison op", mf("orders.order_count", "customers.customer_id", "IN", "[1]"), "invalid metric filter operator"},
+		{"missing value", mf("orders.order_count", "customers.customer_id", ">", ""), "requires a numeric value"},
+		{"non-numeric value", mf("orders.order_count", "customers.customer_id", ">", `"zero"`), "must be a number"},
+		{"field and metric together", query.Filter{Metric: "orders.order_count", GroupBy: "customers.customer_id",
+			Field: "orders.status", Op: ">", Value: json.RawMessage(`0`)}, "both field and metric"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &query.Query{Metrics: []string{"orders.revenue"}, Filters: []query.Filter{tc.f}}
+			expectErrorContaining(t, tc.name, tc.want, query.Validate(q, m))
+		})
+	}
+
+	t.Run("metric filter inside OR rejected", func(t *testing.T) {
+		q := &query.Query{
+			Metrics: []string{"orders.revenue"},
+			Filters: []query.Filter{{Or: []query.Filter{
+				mf("orders.order_count", "customers.customer_id", ">", "0"),
+			}}},
+		}
+		expectErrorContaining(t, "metric in or", "not allowed inside OR", query.Validate(q, m))
 	})
 }
 

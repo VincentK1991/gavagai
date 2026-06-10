@@ -50,3 +50,8 @@ func (renderer) QuoteIdent(ident string) string {
 // QuoteTable emits a PostgreSQL schema-qualified table path unquoted, e.g.
 // analytics.orders.
 func (renderer) QuoteTable(source string) string { return source }
+
+// NullSafeEq uses PostgreSQL's native IS NOT DISTINCT FROM operator.
+func (renderer) NullSafeEq(expr, lit string) string {
+	return expr + " IS NOT DISTINCT FROM " + lit
+}

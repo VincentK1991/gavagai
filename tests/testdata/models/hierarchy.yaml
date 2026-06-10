@@ -2,17 +2,26 @@ version: "0.2.0.dev0"
 semantic_model:
   - name: org_hierarchy
     description: >
-      Organisational hierarchy model used by §2.2 self-join tests (all PENDING).
-      The employees-to-manager relationship is a self-join (from == to), which
-      the planner does not yet support. When self-joins are implemented the
-      compiler should assign distinct aliases (e.g. e1, e2) to each side.
+      Organisational hierarchy model used by the §2.2 self-join tests. The
+      self-join is modelled with a ROLE DATASET (LookML's `from:` pattern):
+      `managers` is a second logical dataset over the same physical source as
+      `employees`, and the employee→manager relationship relates the two
+      names. The compiler then produces an ordinary join with distinct
+      aliases:
+
+        FROM hr.employees AS "employees"
+        LEFT JOIN hr.employees AS "managers"
+          ON "employees"."manager_id" = "managers"."employee_id"
+
+      A relationship whose from == to is rejected by model validation, with a
+      pointer to this pattern.
 
     datasets:
 
       - name: employees
         source: hr.employees
         primary_key: [employee_id]
-        description: One row per employee.
+        description: One row per employee (the report role).
         fields:
           - name: employee_id
             expression:
@@ -48,28 +57,64 @@ semantic_model:
                 - dialect: ANSI_SQL
                   expression: salary
 
+      # Role dataset: the SAME physical table as employees under a second
+      # logical name, playing the "manager" role in the relationship below.
+      - name: managers
+        source: hr.employees
+        primary_key: [employee_id]
+        description: One row per employee, in the manager role.
+        fields:
+          - name: employee_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: employee_id
+
+          - name: name
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: name
+            dimension:
+              is_time: false
+
+          - name: department
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: department
+            dimension:
+              is_time: false
+
+          - name: salary
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: salary
+
     relationships:
-      # NOTE: self-join (from == to) is not yet supported by the planner.
-      # When supported, this should produce:
-      #   FROM hr.employees AS e1 LEFT JOIN hr.employees AS e2
-      #     ON e1.manager_id = e2.employee_id
+      # employees (many) -> managers (one): each employee has one manager.
       - name: employee_to_manager
         from: employees
-        to: employees
+        to: managers
         from_columns: [manager_id]
         to_columns: [employee_id]
 
     metrics:
       - name: headcount
-        description: Total number of employees.
+        description: Total number of employees (COUNT(*) — fan-out safe per group).
         expression:
           dialects:
             - dialect: ANSI_SQL
               expression: COUNT(*)
 
       - name: total_salary
-        description: Sum of all employee salaries (unsafe — fan-out if joined).
+        description: >
+          Sum of salaries. Referenced at the managers grain (the "one" side)
+          alongside an employees dimension, this fans out — each manager row
+          is duplicated per report — and the planner refuses it. Used only by
+          the fan-out test, which errors before any SQL is emitted.
         expression:
           dialects:
             - dialect: ANSI_SQL
-              expression: SUM(employees.salary)
+              expression: SUM(salary)

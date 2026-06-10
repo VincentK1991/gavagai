@@ -56,3 +56,9 @@ func (renderer) QuoteIdent(ident string) string {
 func (renderer) QuoteTable(source string) string {
 	return "`" + strings.ReplaceAll(source, "`", "") + "`"
 }
+
+// NullSafeEq expands the null-safe equality: BigQuery has no
+// IS NOT DISTINCT FROM operator, so the general form is emitted.
+func (renderer) NullSafeEq(expr, lit string) string {
+	return "(" + expr + " = " + lit + " OR (" + expr + " IS NULL AND " + lit + " IS NULL))"
+}

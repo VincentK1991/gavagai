@@ -173,6 +173,16 @@ semantic_model:
             dimension:
               is_time: false
 
+          # §12 nested expression: ${status_label} expands to that field's
+          # expression (parenthesised) before planning.
+          - name: status_label_upper
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "UPPER(${status_label})"
+            dimension:
+              is_time: false
+
           # §6.1 nested CASE WHEN dimension
           - name: status_label_nested
             expression:
@@ -372,3 +382,10 @@ semantic_model:
           dialects:
             - dialect: ANSI_SQL
               expression: "SUM(orders.amount) / NULLIF(COUNT(*), 0)"
+
+      - name: customer_count
+        description: Number of distinct customers (customer-grain count, used by metric-filter tests).
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: COUNT(DISTINCT customers.customer_id)

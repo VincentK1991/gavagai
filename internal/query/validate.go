@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -19,10 +20,13 @@ func (e ValidationError) Error() string {
 }
 
 // validFilterOps is the complete set of operators accepted in a Filter.
+// IS NOT DISTINCT FROM is null-safe equality: rendered natively on PostgreSQL
+// and as the expanded (a = b OR (a IS NULL AND b IS NULL)) form on BigQuery.
 var validFilterOps = map[string]bool{
 	"=": true, "!=": true, ">": true, ">=": true, "<": true, "<=": true,
 	"IN": true, "NOT IN": true,
 	"IS NULL": true, "IS NOT NULL": true,
+	"IS NOT DISTINCT FROM": true,
 }
 
 // validHavingOps is the set of operators accepted in a Having clause.
@@ -109,14 +113,25 @@ func Validate(q *Query, m *model.SemanticModel) []ValidationError {
 	for i, f := range q.Filters {
 		path := fmt.Sprintf("filters[%d]", i)
 		if len(f.Or) > 0 {
+			if f.Metric != "" {
+				add(path, "a filter cannot set both metric and or")
+			}
 			for j, sub := range f.Or {
 				subPath := fmt.Sprintf("%s.or[%d]", path, j)
 				if len(sub.Or) > 0 {
 					add(subPath, "nested OR groups are not supported")
 					continue
 				}
+				if sub.Metric != "" {
+					add(subPath, "metric filters are not allowed inside OR groups")
+					continue
+				}
 				validateLeafFilter(add, subPath, sub, datasets)
 			}
+			continue
+		}
+		if f.Metric != "" {
+			validateMetricFilter(add, path, f, datasets, metrics)
 			continue
 		}
 		validateLeafFilter(add, path, f, datasets)
@@ -175,6 +190,58 @@ func Validate(q *Query, m *model.SemanticModel) []ValidationError {
 	}
 
 	return errs
+}
+
+// validateMetricFilter checks a metric filter: metric and group_by must be
+// resolvable references, the operator must be a numeric comparison, and the
+// value must be a number. Field must not be set alongside Metric.
+func validateMetricFilter(add func(path, msg string), path string, f Filter,
+	datasets map[string]map[string]model.Field, metrics map[string]bool) {
+
+	if f.Field != "" {
+		add(path, "a filter cannot set both field and metric")
+	}
+
+	ds, name, ok := parseRef(f.Metric)
+	if !ok {
+		add(path, fmt.Sprintf("invalid metric reference %q: must be dataset.metric_name", f.Metric))
+	} else {
+		if _, exists := datasets[ds]; !exists {
+			add(path, fmt.Sprintf("unknown dataset %q in metric filter %q", ds, f.Metric))
+		}
+		if !metrics[name] {
+			add(path, fmt.Sprintf("unknown metric %q in metric filter", name))
+		}
+	}
+
+	if f.GroupBy == "" {
+		add(path, "metric filter requires group_by (the entity field to aggregate to)")
+	} else {
+		gds, gname, gok := parseRef(f.GroupBy)
+		if !gok {
+			add(path, fmt.Sprintf("invalid group_by reference %q: must be dataset.field_name", f.GroupBy))
+		} else {
+			dsFields, exists := datasets[gds]
+			if !exists {
+				add(path, fmt.Sprintf("unknown dataset %q in group_by %q", gds, f.GroupBy))
+			} else if _, found := dsFields[gname]; !found {
+				add(path, fmt.Sprintf("unknown field %q in dataset %q (group_by)", gname, gds))
+			}
+		}
+	}
+
+	if !validHavingOps[f.Op] {
+		add(path, fmt.Sprintf("invalid metric filter operator %q; valid operators: %s", f.Op, sortedKeys(validHavingOps)))
+	}
+
+	if len(f.Value) == 0 {
+		add(path, "metric filter requires a numeric value")
+	} else {
+		var n json.Number
+		if err := json.Unmarshal(f.Value, &n); err != nil {
+			add(path, fmt.Sprintf("metric filter value must be a number, got: %s", f.Value))
+		}
+	}
 }
 
 // validateLeafFilter checks one leaf predicate (field reference, operator, and
